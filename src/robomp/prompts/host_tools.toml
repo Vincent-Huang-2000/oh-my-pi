@@ -6,13 +6,13 @@ body = "Markdown body of the comment."
 number = "Optional issue/PR number override. Default is the inbound thread (PR for PR conversations/reviews, originating issue otherwise)."
 
 [gh_push_branch]
-description = "Push the workspace branch to origin. Uses credentials configured by the orchestrator."
+description = "Push the workspace branch to origin. Uses credentials configured by the orchestrator. Before contacting the remote, runs `bun run fix` then `bun check` when the repo defines them, auto-committing any formatter diff as `style: bun run fix`. If `bun check` fails, fix the cause and call again."
 
 [gh_push_branch.parameters]
 branch = "Optional explicit branch name; defaults to the workspace branch."
 
 [gh_open_pr]
-description = "Open a pull request from the workspace branch using the PR body template. Before talking to GitHub, runs `bun run fix` then `bun check` when the repo defines them, auto-committing any formatter diff as `style: bun run fix`. If `bun check` fails, fix the cause and call again."
+description = "Open a pull request from the workspace branch using the PR body template. Same pre-publish gate as `gh_push_branch`: runs `bun run fix` then `bun check` when the repo defines them, auto-committing formatter diffs. If `bun check` fails, fix the cause and call again."
 
 [gh_open_pr.parameters]
 body = "Markdown body. MUST include the four template sections in order: `## Repro`, `## Cause`, `## Fix`, `## Verification`."

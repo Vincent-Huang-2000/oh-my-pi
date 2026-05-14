@@ -5,31 +5,22 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping
 from typing import Any
-from urllib.parse import urlparse
 
 from robomp import persona
 from robomp.config import Settings
 from robomp.db import Database, IssueRow, IssueState, issue_key
+from robomp.github_backend import GitHubBackend
 from robomp.github_client import (
     CommentInfo,
-    GitHubClient,
     GitHubError,
     IssueInfo,
     RepoInfo,
     parse_issue_payload,
 )
-from robomp.sandbox import SandboxManager
+from robomp.sandbox import GitTransport, SandboxManager
 from robomp.worker import DirectiveInfo, TaskInputs, ThreadMessage, run_task
 
 log = logging.getLogger(__name__)
-
-
-def _credentialed_clone_url(clone_url: str, token: str, bot_login: str) -> str:
-    parsed = urlparse(clone_url)
-    if parsed.scheme not in {"http", "https"}:
-        return clone_url
-    netloc = parsed.netloc.split("@", 1)[-1]
-    return f"{parsed.scheme}://{bot_login}:{token}@{netloc}{parsed.path}"
 
 
 def _comment_from_payload(payload: Mapping[str, Any]) -> CommentInfo:
@@ -66,7 +57,7 @@ def _directive_from_payload(payload: Mapping[str, Any]) -> DirectiveInfo | None:
 
 
 async def _fetch_thread(
-    github: GitHubClient,
+    github: GitHubBackend,
     repo: str,
     number: int,
     *,
@@ -147,7 +138,7 @@ async def _fetch_thread(
 
 
 async def _attach_thread(
-    github: GitHubClient,
+    github: GitHubBackend,
     directive: DirectiveInfo | None,
     repo: str,
     number: int,
@@ -162,7 +153,7 @@ async def _attach_thread(
 
 
 async def _resolve_repo_and_issue(
-    github: GitHubClient,
+    github: GitHubBackend,
     payload: Mapping[str, Any],
 ) -> tuple[RepoInfo, IssueInfo]:
     repo, issue = parse_issue_payload(payload)
@@ -179,10 +170,12 @@ async def triage_issue(
     *,
     settings: Settings,
     db: Database,
-    github: GitHubClient,
+    github: GitHubBackend,
     sandbox: SandboxManager,
+    git_transport: GitTransport,
     payload: Mapping[str, Any],
     delivery_id: str,
+    attempts: int = 0,
 ) -> None:
     repo, issue = await _resolve_repo_and_issue(github, payload)
     if issue.is_pull_request:
@@ -190,11 +183,7 @@ async def triage_issue(
         return
     key = issue_key(repo.full_name, issue.number)
     db.upsert_issue(key=key, repo=repo.full_name, number=issue.number, state="reproducing")
-    clone_url = _credentialed_clone_url(
-        repo.clone_url,
-        settings.github_token.get_secret_value(),
-        settings.bot_login,
-    )
+    clone_url = repo.clone_url
     workspace = sandbox.ensure_workspace(
         repo=repo.full_name,
         number=issue.number,
@@ -216,10 +205,12 @@ async def triage_issue(
         settings=settings,
         db=db,
         github=github,
+        git_transport=git_transport,
         repo=repo,
         issue=issue,
         workspace=workspace,
         delivery_id=delivery_id,
+        attempts=attempts,
     )
     await run_task(task_kind="triage_issue", inputs=inputs)
 
@@ -228,21 +219,19 @@ async def handle_comment(
     *,
     settings: Settings,
     db: Database,
-    github: GitHubClient,
+    github: GitHubBackend,
     sandbox: SandboxManager,
+    git_transport: GitTransport,
     payload: Mapping[str, Any],
     delivery_id: str,
+    attempts: int = 0,
 ) -> None:
     repo, issue = await _resolve_repo_and_issue(github, payload)
     key = issue_key(repo.full_name, issue.number)
     existing = db.get_issue(key)
     directive = _directive_from_payload(payload)
     comment = _comment_from_payload(payload)
-    clone_url = _credentialed_clone_url(
-        repo.clone_url,
-        settings.github_token.get_secret_value(),
-        settings.bot_login,
-    )
+    clone_url = repo.clone_url
 
     if existing is None:
         if directive is None:
@@ -274,10 +263,12 @@ async def handle_comment(
             settings=settings,
             db=db,
             github=github,
+            git_transport=git_transport,
             repo=repo,
             issue=issue,
             workspace=workspace,
             delivery_id=delivery_id,
+            attempts=attempts,
         )
         directive = await _attach_thread(github, directive, repo.full_name, issue.number, is_pr=False)
         await run_task(task_kind="triage_issue", inputs=inputs, directive=directive)
@@ -321,10 +312,12 @@ async def handle_comment(
             settings=settings,
             db=db,
             github=github,
+            git_transport=git_transport,
             repo=repo,
             issue=issue,
             workspace=workspace,
             delivery_id=delivery_id,
+            attempts=attempts,
         )
         directive = await _attach_thread(github, directive, repo.full_name, issue.number, is_pr=False)
         await run_task(task_kind="handle_comment", inputs=inputs, comment=comment, directive=directive)
@@ -344,10 +337,12 @@ async def handle_comment(
         settings=settings,
         db=db,
         github=github,
+        git_transport=git_transport,
         repo=repo,
         issue=issue,
         workspace=workspace,
         delivery_id=delivery_id,
+        attempts=attempts,
     )
     directive = await _attach_thread(github, directive, repo.full_name, issue.number, is_pr=False)
     await run_task(task_kind="handle_comment", inputs=inputs, comment=comment, directive=directive)
@@ -357,10 +352,12 @@ async def handle_review(
     *,
     settings: Settings,
     db: Database,
-    github: GitHubClient,
+    github: GitHubBackend,
     sandbox: SandboxManager,
+    git_transport: GitTransport,
     payload: Mapping[str, Any],
     delivery_id: str,
+    attempts: int = 0,
 ) -> None:
     pr = payload.get("pull_request") or {}
     pr_number = int(pr.get("number") or 0)
@@ -383,11 +380,7 @@ async def handle_review(
     except GitHubError as exc:
         log.warning("review fetch failed", extra={"err": str(exc)})
         return
-    clone_url = _credentialed_clone_url(
-        repo.clone_url,
-        settings.github_token.get_secret_value(),
-        settings.bot_login,
-    )
+    clone_url = repo.clone_url
     workspace = sandbox.ensure_workspace(
         repo=repo.full_name,
         number=issue.number,
@@ -412,10 +405,12 @@ async def handle_review(
         settings=settings,
         db=db,
         github=github,
+        git_transport=git_transport,
         repo=repo,
         issue=issue,
         workspace=workspace,
         delivery_id=delivery_id,
+        attempts=attempts,
     )
     await run_task(
         task_kind="handle_review",
@@ -429,10 +424,12 @@ async def handle_pr_conversation(
     *,
     settings: Settings,
     db: Database,
-    github: GitHubClient,
+    github: GitHubBackend,
     sandbox: SandboxManager,
+    git_transport: GitTransport,
     payload: Mapping[str, Any],
     delivery_id: str,
+    attempts: int = 0,
 ) -> None:
     """Handle a regular (non-review) comment on a bot-authored PR.
 
@@ -481,11 +478,7 @@ async def handle_pr_conversation(
     except GitHubError as exc:
         log.warning("pr-conversation fetch failed", extra={"err": str(exc)})
         return
-    clone_url = _credentialed_clone_url(
-        repo.clone_url,
-        settings.github_token.get_secret_value(),
-        settings.bot_login,
-    )
+    clone_url = repo.clone_url
     # On a reopen the prior branch is stale (merged/deleted), so branch from
     # default; otherwise reuse the existing branch.
     existing_branch = (
@@ -515,10 +508,12 @@ async def handle_pr_conversation(
         settings=settings,
         db=db,
         github=github,
+        git_transport=git_transport,
         repo=repo,
         issue=issue,
         workspace=workspace,
         delivery_id=delivery_id,
+        attempts=attempts,
     )
     directive = await _attach_thread(github, directive, repo_full, pr_number, is_pr=True)
     await run_task(task_kind="handle_comment", inputs=inputs, comment=comment, pr_number=pr_number, directive=directive)

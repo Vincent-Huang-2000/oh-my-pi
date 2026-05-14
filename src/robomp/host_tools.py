@@ -20,8 +20,10 @@ from omp_rpc import HostTool, HostToolContext, RpcCommandError, host_tool
 
 from robomp import persona
 from robomp.db import Database, issue_key
-from robomp.github_client import GitHubClient, GitHubError, IssueInfo, RepoInfo
-from robomp.sandbox import Workspace
+from robomp.git_ops import GitCommandError, HeadDriftError, rev_parse_head
+from robomp.github_backend import GitHubBackend
+from robomp.github_client import GitHubError, IssueInfo, RepoInfo
+from robomp.sandbox import GitTransport, Workspace, workspace_key
 
 log = logging.getLogger(__name__)
 _PRE_PR_FIX_COMMAND = ("bun", "run", "fix")
@@ -37,7 +39,8 @@ class ToolBindings:
     """Per-task closure that the host tools capture."""
 
     db: Database
-    github: GitHubClient
+    github: GitHubBackend
+    git_transport: GitTransport
     repo: RepoInfo
     issue: IssueInfo
     workspace: Workspace
@@ -127,13 +130,17 @@ def _format_process_output(stdout: Any, stderr: Any) -> str:
     )
 
 
-def _run_pre_pr_bun_fix(bindings: ToolBindings, args: Mapping[str, Any]) -> None:
+def _run_pre_publish_bun_fix(bindings: ToolBindings, args: Mapping[str, Any], *, tool_name: str, stage: str) -> None:
     """Run `bun run fix` then commit any working-tree diff as the bot.
 
     Silently no-ops when the repository does not define a `scripts.fix`
     entry. Anything the formatter touches gets folded into a fresh
     `style: bun run fix` commit so the downstream cleanliness gate sees a
     pristine worktree.
+
+    `tool_name` is the host tool calling this (audit attribution).
+    `stage` is the human-readable verb used in error wording — "open PR"
+    when called from `gh_open_pr`, "push" when called from `gh_push_branch`.
     """
     if not _has_bun_script(bindings.workspace.repo_dir, "fix"):
         return
@@ -148,28 +155,28 @@ def _run_pre_pr_bun_fix(bindings: ToolBindings, args: Mapping[str, Any]) -> None
             timeout=_PRE_PR_FIX_TIMEOUT_SECONDS,
         )
     except FileNotFoundError:
-        msg = "refusing to open PR: `bun run fix` is required before PR creation, but `bun` is not on PATH."
-        _audit(bindings, "gh_open_pr", args, error=msg)
+        msg = f"refusing to {stage}: `bun run fix` is required before {stage}, but `bun` is not on PATH."
+        _audit(bindings, tool_name, args, error=msg)
         _raise_command(msg)
     except subprocess.TimeoutExpired as exc:
         output = _format_process_output(exc.stdout, exc.stderr)
         msg = (
-            "refusing to open PR: `bun run fix` timed out before PR creation.\n"
+            f"refusing to {stage}: `bun run fix` timed out before {stage}.\n"
             f"{output}\n\n"
-            "Investigate the hang, rerun the formatter, commit any resulting changes, "
-            "and retry `gh_open_pr`."
+            f"Investigate the hang, rerun the formatter, commit any resulting changes, "
+            f"and retry."
         )
-        _audit(bindings, "gh_open_pr", args, error=msg)
+        _audit(bindings, tool_name, args, error=msg)
         _raise_command(msg)
     if proc.returncode != 0:
         output = _format_process_output(proc.stdout, proc.stderr)
         msg = (
-            f"refusing to open PR: `bun run fix` failed before PR creation (exit {proc.returncode}).\n"
+            f"refusing to {stage}: `bun run fix` failed before {stage} (exit {proc.returncode}).\n"
             f"{output}\n\n"
-            "Resolve the formatter failure, rerun `bun run fix` successfully, commit any "
-            "resulting changes, and retry `gh_open_pr`."
+            f"Resolve the formatter failure, rerun `bun run fix` successfully, commit any "
+            f"resulting changes, and retry."
         )
-        _audit(bindings, "gh_open_pr", args, error=msg)
+        _audit(bindings, tool_name, args, error=msg)
         _raise_command(msg)
 
     status = subprocess.run(
@@ -191,8 +198,8 @@ def _run_pre_pr_bun_fix(bindings: ToolBindings, args: Mapping[str, Any]) -> None
     )
     if add.returncode != 0:
         err = (add.stderr or add.stdout).strip()
-        msg = f"refusing to open PR: `git add -A` failed after `bun run fix`: {err}"
-        _audit(bindings, "gh_open_pr", args, error=msg)
+        msg = f"refusing to {stage}: `git add -A` failed after `bun run fix`: {err}"
+        _audit(bindings, tool_name, args, error=msg)
         _raise_command(msg)
     commit = subprocess.run(
         [
@@ -212,12 +219,12 @@ def _run_pre_pr_bun_fix(bindings: ToolBindings, args: Mapping[str, Any]) -> None
     )
     if commit.returncode != 0:
         err = (commit.stderr or commit.stdout).strip()
-        msg = f"refusing to open PR: failed to commit `bun run fix` changes: {err}"
-        _audit(bindings, "gh_open_pr", args, error=msg)
+        msg = f"refusing to {stage}: failed to commit `bun run fix` changes: {err}"
+        _audit(bindings, tool_name, args, error=msg)
         _raise_command(msg)
 
 
-def _run_pre_pr_bun_check(bindings: ToolBindings, args: Mapping[str, Any]) -> None:
+def _run_pre_publish_bun_check(bindings: ToolBindings, args: Mapping[str, Any], *, tool_name: str, stage: str) -> None:
     if not _has_bun_script(bindings.workspace.repo_dir, "check"):
         return
     try:
@@ -230,28 +237,28 @@ def _run_pre_pr_bun_check(bindings: ToolBindings, args: Mapping[str, Any]) -> No
             timeout=_PRE_PR_CHECK_TIMEOUT_SECONDS,
         )
     except FileNotFoundError:
-        msg = "refusing to open PR: `bun check` is required before PR creation, but `bun` is not on PATH."
-        _audit(bindings, "gh_open_pr", args, error=msg)
+        msg = f"refusing to {stage}: `bun check` is required before {stage}, but `bun` is not on PATH."
+        _audit(bindings, tool_name, args, error=msg)
         _raise_command(msg)
     except subprocess.TimeoutExpired as exc:
         output = _format_process_output(exc.stdout, exc.stderr)
         msg = (
-            "refusing to open PR: `bun check` timed out before PR creation.\n"
+            f"refusing to {stage}: `bun check` timed out before {stage}.\n"
             f"{output}\n\n"
-            "Fix the check hang/failure, rerun `bun check`, commit any resulting changes, "
-            "and retry `gh_open_pr`."
+            f"Fix the check hang/failure, rerun `bun check`, commit any resulting changes, "
+            f"and retry."
         )
-        _audit(bindings, "gh_open_pr", args, error=msg)
+        _audit(bindings, tool_name, args, error=msg)
         _raise_command(msg)
     if proc.returncode != 0:
         output = _format_process_output(proc.stdout, proc.stderr)
         msg = (
-            f"refusing to open PR: `bun check` failed before PR creation (exit {proc.returncode}).\n"
+            f"refusing to {stage}: `bun check` failed before {stage} (exit {proc.returncode}).\n"
             f"{output}\n\n"
-            "Fix the reported failures, rerun `bun check` successfully, commit any resulting changes, "
-            "and retry `gh_open_pr`."
+            f"Fix the reported failures, rerun `bun check` successfully, commit any resulting changes, "
+            f"and retry."
         )
-        _audit(bindings, "gh_open_pr", args, error=msg)
+        _audit(bindings, tool_name, args, error=msg)
         _raise_command(msg)
 
 
@@ -318,17 +325,13 @@ def _guarded_push_branch(bindings: ToolBindings, args: Mapping[str, Any], tool_n
         capture_output=True,
         text=True,
     )
-    # Verify there's at least one commit on the branch.
-    rev = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=repo_dir,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if rev.returncode != 0:
-        _audit(bindings, tool_name, args, error=rev.stderr.strip())
-        _raise_command(f"git rev-parse failed: {rev.stderr.strip()}")
+    repo_dir_path = bindings.workspace.repo_dir
+    try:
+        head_sha = rev_parse_head(repo_dir_path)
+    except GitCommandError as exc:
+        err = (exc.stderr or exc.stdout).strip() or f"exit {exc.returncode}"
+        _audit(bindings, tool_name, args, error=err)
+        _raise_command(f"git rev-parse failed: {err}")
 
     # Identity gate: every commit between the base branch and HEAD must
     # carry the configured author. Refuse to push otherwise so the agent
@@ -389,26 +392,42 @@ def _guarded_push_branch(bindings: ToolBindings, args: Mapping[str, Any], tool_n
         _audit(bindings, tool_name, args, error=msg)
         _raise_command(msg)
 
-    proc = subprocess.run(
-        ["git", "push", "--set-upstream", "origin", branch],
-        cwd=repo_dir,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout).strip()
+    try:
+        result = bindings.git_transport.push_branch(
+            repo=bindings.repo.full_name,
+            workspace_key=workspace_key(bindings.repo.full_name, bindings.issue.number),
+            repo_dir=repo_dir_path,
+            branch=branch,
+            expected_head=head_sha,
+        )
+    except HeadDriftError:
+        msg = (
+            "refusing to push: HEAD changed between preflight and push "
+            "(another commit landed; rerun the gate by re-issuing the push)."
+        )
+        _audit(bindings, tool_name, args, error=msg)
+        _raise_command(msg)
+    except GitCommandError as exc:
+        err = (exc.stderr or exc.stdout).strip() or f"exit {exc.returncode}"
         _audit(bindings, tool_name, args, error=err)
         _raise_command(f"git push failed: {err}")
-    head = rev.stdout.strip()
-    _audit(bindings, tool_name, args, result={"head": head, "branch": branch})
-    return head
+    except GitHubError as exc:
+        msg = f"gh-proxy rejected push: {exc.status} {exc.message}"
+        _audit(bindings, tool_name, args, error=msg)
+        _raise_command(msg)
+    _audit(bindings, tool_name, args, result={"head": result.head, "branch": result.branch})
+    return result.head
 
 
 # ---------- gh_push_branch ----------
 def _build_push_branch(bindings: ToolBindings) -> HostTool[Any, Any]:
     def execute(args: dict[str, Any], _ctx: HostToolContext[Any]) -> str:
         branch = str(args.get("branch") or bindings.workspace.branch)
+        # Same gate as gh_open_pr — formatter + check before bytes leave the
+        # workstation, so CI doesn't blow up on a follow-up commit. The fix
+        # pass auto-commits any formatter diff so the push includes it.
+        _run_pre_publish_bun_fix(bindings, args, tool_name="gh_push_branch", stage="push")
+        _run_pre_publish_bun_check(bindings, args, tool_name="gh_push_branch", stage="push")
         head = _guarded_push_branch(bindings, args, "gh_push_branch", branch)
         return f"pushed {branch} at {head[:12]} as {bindings.author_name} <{bindings.author_email}>"
 
@@ -454,8 +473,8 @@ def _build_open_pr(bindings: ToolBindings) -> HostTool[Any, Any]:
                 "GitHub auto-closes the issue when the PR merges. Put it at the end of the "
                 "Verification section per the template."
             )
-        _run_pre_pr_bun_fix(bindings, args)
-        _run_pre_pr_bun_check(bindings, args)
+        _run_pre_publish_bun_fix(bindings, args, tool_name="gh_open_pr", stage="open PR")
+        _run_pre_publish_bun_check(bindings, args, tool_name="gh_open_pr", stage="open PR")
         # Make sure the branch is pushed (idempotent) using the same preflight as gh_push_branch.
         _guarded_push_branch(bindings, args, "gh_open_pr", bindings.workspace.branch)
         base = args.get("base") or bindings.repo.default_branch

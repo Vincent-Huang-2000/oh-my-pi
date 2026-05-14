@@ -135,6 +135,11 @@ def kickoff(*, repo: RepoInfo, issue: IssueInfo, workspace: Workspace) -> str:
     return render(_load("kickoff_issue.md"), {"repo": repo, "issue": issue, "workspace": workspace})
 
 
+def resume_triage(*, repo: RepoInfo, issue: IssueInfo, workspace: Workspace) -> str:
+    """Resume prompt for a `triage_issue` task whose omp session already exists."""
+    return render(_load("resume_triage.md"), {"repo": repo, "issue": issue, "workspace": workspace})
+
+
 def _render_thread(messages: tuple) -> str:
     """Render a `tuple[ThreadMessage, ...]` as a markdown block for prompt embed.
 
@@ -310,6 +315,7 @@ __all__ = [
     "kickoff",
     "kickoff_directive",
     "render",
+    "resume_triage",
     "seed_phases",
     "system_append",
     "unable_to_reproduce_comment",

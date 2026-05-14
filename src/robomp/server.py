@@ -24,7 +24,8 @@ from robomp.db import (
 from robomp.db import (
     issue_key as make_issue_key,
 )
-from robomp.github_client import GitHubClient, GitHubError
+from robomp.github_backend import GitHubBackend
+from robomp.github_client import GitHubError
 from robomp.manual_triage import (
     InvalidIssueRef,
     ManualTriageConflict,
@@ -32,18 +33,47 @@ from robomp.manual_triage import (
     enqueue_manual_triage,
     parse_issue_ref,
 )
+from robomp.proxy_client import GitHubProxyClient, ProxyGitTransport
 from robomp.queue import WorkerPool
 from robomp.sandbox import SandboxManager
 
 log = logging.getLogger(__name__)
 
 
+def _require_proxy_mode(cfg: Settings) -> tuple[str, bytes]:
+    if cfg.github_token is not None:
+        raise SystemExit(
+            "robomp orchestrator refuses to start with GITHUB_TOKEN set in env. "
+            "The PAT must live only in the gh-proxy container."
+        )
+    if cfg.gh_proxy_url is None or cfg.gh_proxy_hmac_key is None:
+        raise SystemExit(
+            "robomp orchestrator requires ROBOMP_GH_PROXY_URL and "
+            "ROBOMP_GH_PROXY_HMAC_KEY (run gh-proxy in a sibling container)."
+        )
+    return cfg.gh_proxy_url, cfg.gh_proxy_hmac_key.get_secret_value().encode("utf-8")
+
+
+def _build_orchestrator(cfg: Settings) -> tuple[GitHubBackend, ProxyGitTransport]:
+    base_url, key = _require_proxy_mode(cfg)
+    github = GitHubProxyClient(base_url=base_url, hmac_key=key)
+    transport = ProxyGitTransport(base_url=base_url, hmac_key=key)
+    return github, transport
+
+
 def _build_state(settings: Settings) -> dict[str, Any]:
     db = get_database(settings.sqlite_path)
-    github = GitHubClient(settings.github_token.get_secret_value())
-    sandbox = SandboxManager(settings.workspace_root)
-    pool = WorkerPool(settings=settings, db=db, github=github, sandbox=sandbox)
-    return {"settings": settings, "db": db, "github": github, "sandbox": sandbox, "pool": pool}
+    github, git_transport = _build_orchestrator(settings)
+    sandbox = SandboxManager(settings.workspace_root, transport=git_transport)
+    pool = WorkerPool(settings=settings, db=db, github=github, sandbox=sandbox, git_transport=git_transport)
+    return {
+        "settings": settings,
+        "db": db,
+        "github": github,
+        "git_transport": git_transport,
+        "sandbox": sandbox,
+        "pool": pool,
+    }
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -60,7 +90,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             yield
         finally:
-            await pool.stop()
+            await pool.stop(
+                drain_timeout=cfg.shutdown_drain_timeout_seconds,
+                kill_timeout=cfg.shutdown_kill_timeout_seconds,
+            )
 
     app = FastAPI(title="robomp", version="0.1.0", lifespan=lifespan)
 
@@ -247,7 +280,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if state not in ("open", "closed", "all"):
             raise HTTPException(400, "state must be open|closed|all")
         capped = max(1, min(int(limit), 100))
-        github: GitHubClient = bag["github"]
+        github: GitHubBackend = bag["github"]
         repos = sorted(cfg.repo_allowlist)
         if not repos:
             return {"issues": [], "errors": [], "repos": []}
@@ -307,7 +340,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _require_trigger_token(cfg, x_robomp_token)
 
         db: Database = bag["db"]
-        github: GitHubClient = bag["github"]
+        github: GitHubBackend = bag["github"]
         pool: WorkerPool = bag["pool"]
 
         mode = str(payload.get("mode") or "").strip().lower()

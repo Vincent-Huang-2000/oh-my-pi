@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from omp_rpc import (
@@ -28,9 +29,10 @@ from robomp import host_tools, persona, pragmas
 from robomp.cancellation import register_cancel_hook, unregister_cancel_hook
 from robomp.config import Settings
 from robomp.db import Database, issue_key
-from robomp.github_client import CommentInfo, GitHubClient, IssueInfo, RepoInfo
+from robomp.github_backend import GitHubBackend
+from robomp.github_client import CommentInfo, IssueInfo, RepoInfo
 from robomp.host_tools import ToolBindings
-from robomp.sandbox import Workspace
+from robomp.sandbox import GitTransport, Workspace
 
 log = logging.getLogger(__name__)
 
@@ -41,11 +43,13 @@ class TaskInputs:
 
     settings: Settings
     db: Database
-    github: GitHubClient
+    github: GitHubBackend
+    git_transport: GitTransport
     repo: RepoInfo
     issue: IssueInfo
     workspace: Workspace
     delivery_id: str
+    attempts: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -94,10 +98,39 @@ def _resolve_pragma_overrides(
     return model_override, thinking_override
 
 
+_SCRUBBED_ENV_KEYS: tuple[str, ...] = (
+    # Secrets that MUST NOT reach the agent subprocess; an agent with the
+    # `bash` tool could otherwise `printenv` them out of robomp's env.
+    "GITHUB_TOKEN",
+    "GITHUB_WEBHOOK_SECRET",
+    "ROBOMP_REPLAY_TOKEN",
+    "ROBOMP_GH_PROXY_HMAC_KEY",
+)
+
+
 def _build_extra_env(settings: Settings) -> dict[str, str]:
-    """Pass the GitHub token to subprocesses that need it (git push uses the credentialed remote)."""
-    env: dict[str, str] = {}
-    return env
+    """Build the env overlay passed to the omp subprocess.
+
+    `omp_rpc` merges this dict on top of `os.environ`, so overlaying empty
+    strings for the sensitive keys is what actually masks them in the
+    child — `del` on the parent's env would not help us here.
+    """
+    del settings  # kept for future hooks (model-specific env, etc.)
+    return dict.fromkeys(_SCRUBBED_ENV_KEYS, "")
+
+
+def _has_prior_session(session_dir: Path) -> bool:
+    """Return True iff `session_dir` already contains an omp JSONL transcript.
+
+    pi's `coding-agent` writes one `*.jsonl` per session into `--session-dir`.
+    The presence of any such file is the signal that `--continue` will pick
+    up the most recent transcript (`SessionManager.continueRecent`) rather
+    than starting fresh.
+    """
+    try:
+        return any(session_dir.glob("*.jsonl"))
+    except OSError:
+        return False
 
 
 def _build_prompt(
@@ -108,8 +141,11 @@ def _build_prompt(
     pr_number: int | None,
     review_payload: dict[str, Any] | None,
     directive: DirectiveInfo | None = None,
+    resuming: bool = False,
 ) -> str:
     if task_kind == "triage_issue":
+        if resuming:
+            return persona.resume_triage(repo=inputs.repo, issue=inputs.issue, workspace=inputs.workspace)
         if directive is not None:
             return persona.kickoff_directive(
                 repo=inputs.repo,
@@ -206,6 +242,18 @@ def _run_rpc_blocking(
             log.debug("delta", extra={"issue": bindings.issue_key, "delta": str(ev.get("delta", ""))[:200]})
 
     rpc_env = _build_extra_env(settings)
+    resuming = _has_prior_session(bindings.workspace.session_dir)
+    extra_args: tuple[str, ...] = ("--continue",) if resuming else ()
+    log.info(
+        "rpc_resume",
+        extra={
+            "issue": bindings.issue_key,
+            "task": task_kind,
+            "resuming": resuming,
+            "session_dir": str(bindings.workspace.session_dir),
+            "attempts": inputs.attempts,
+        },
+    )
     model_override, thinking_override = _resolve_pragma_overrides(directive, settings)
     chosen_model = model_override or settings.pick_model()
     chosen_thinking = thinking_override or settings.thinking_level
@@ -237,6 +285,7 @@ def _run_rpc_blocking(
         request_timeout=settings.request_timeout_seconds,
         startup_timeout=60.0,
         max_event_history=50_000,
+        extra_args=extra_args,
     ) as client:
         # Arm cancellation: from this point the API can kill the omp subprocess
         # out from under us, which makes `prompt_and_wait` raise an `RpcError`
@@ -251,11 +300,19 @@ def _run_rpc_blocking(
             phases = persona.seed_phases(task_kind)
             if phases:
                 try:
-                    if task_kind == "triage_issue":
-                        # Fresh session: seed the full plan.
+                    if task_kind == "triage_issue" and not resuming:
+                        # Fresh triage: seed the full plan.
                         client.set_todos(phases)
+                    elif task_kind == "triage_issue":
+                        # Resumed triage: prior phases are intact in the
+                        # JSONL transcript — re-seeding would clobber any
+                        # in-progress task statuses. Trust the loaded state.
+                        log.info(
+                            "set_todos skipped (resume)",
+                            extra={"issue": bindings.issue_key, "task": task_kind},
+                        )
                     else:
-                        # Resumed session: keep prior phases (e.g. Reproduce / Fix / PR)
+                        # Follow-up: keep prior phases (e.g. Reproduce / Fix / PR)
                         # so the agent still sees the context, but append the
                         # follow-up phase at the end.
                         existing = list(client.get_todos())
@@ -313,6 +370,7 @@ async def run_task(
     bindings = ToolBindings(
         db=inputs.db,
         github=inputs.github,
+        git_transport=inputs.git_transport,
         repo=inputs.repo,
         issue=inputs.issue,
         workspace=inputs.workspace,
@@ -321,8 +379,15 @@ async def run_task(
         author_email=inputs.settings.git_author_email,
         inbound_thread_number=pr_number,
     )
+    resuming = _has_prior_session(inputs.workspace.session_dir)
     prompt = _build_prompt(
-        task_kind, inputs, comment=comment, pr_number=pr_number, review_payload=review_payload, directive=directive
+        task_kind,
+        inputs,
+        comment=comment,
+        pr_number=pr_number,
+        review_payload=review_payload,
+        directive=directive,
+        resuming=resuming,
     )
     return await asyncio.to_thread(
         _run_rpc_blocking,

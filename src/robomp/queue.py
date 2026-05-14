@@ -12,8 +12,8 @@ from robomp import tasks
 from robomp.cancellation import clear_current_event, set_current_event
 from robomp.config import Settings
 from robomp.db import Database, EventRow
-from robomp.github_client import GitHubClient
-from robomp.sandbox import SandboxManager
+from robomp.github_backend import GitHubBackend
+from robomp.sandbox import GitTransport, SandboxManager
 
 log = logging.getLogger(__name__)
 
@@ -26,13 +26,15 @@ class WorkerPool:
         *,
         settings: Settings,
         db: Database,
-        github: GitHubClient,
+        github: GitHubBackend,
         sandbox: SandboxManager,
+        git_transport: GitTransport,
     ) -> None:
         self.settings = settings
         self.db = db
         self.github = github
         self.sandbox = sandbox
+        self.git_transport = git_transport
         self._workers: list[asyncio.Task[None]] = []
         self._wakeup = asyncio.Event()
         self._stop = asyncio.Event()
@@ -44,6 +46,13 @@ class WorkerPool:
         # are GIL-safe for single-key ops, which is all we do.
         self._cancel_hooks: dict[str, Callable[[], None]] = {}
         self._cancelled: set[str] = set()
+        # Phase B (graceful shutdown): track each spawned `_run_event` task so
+        # `stop()` can drain in-flight work, and a flag the exception path
+        # checks to avoid marking shutdown-interrupted rows as `failed` (we
+        # want them to stay `running` so `reset_stuck_running()` requeues
+        # them on next start; the agent then resumes via `--continue`).
+        self._inflight_tasks: dict[asyncio.Task[None], str] = {}
+        self._shutting_down: bool = False
 
     def wake(self) -> None:
         """Signal that new work is available."""
@@ -61,15 +70,50 @@ class WorkerPool:
         # Single dispatcher loop is simpler than N workers; concurrency is gated by the semaphore.
         self._workers.append(asyncio.create_task(self._dispatch_loop(), name="robomp-dispatch"))
 
-    async def stop(self) -> None:
+    async def stop(self, *, drain_timeout: float = 25.0, kill_timeout: float = 5.0) -> None:
+        """Halt the dispatcher, then drain (or kill) in-flight `_run_event` tasks.
+
+        Cleanly interrupted tasks intentionally leave their DB row in
+        `running` so the next `WorkerPool.start()` re-queues them via
+        `reset_stuck_running()`. The resumed omp session then picks up via
+        `--continue` from the persisted JSONL transcript.
+        """
+        self._shutting_down = True
         self._stop.set()
         self._wakeup.set()
+        # 1. Halt the dispatcher (no new claims).
         for worker in self._workers:
             worker.cancel()
         for worker in self._workers:
             with suppress(asyncio.CancelledError):
                 await worker
         self._workers.clear()
+        # 2. Give in-flight tasks a chance to drain.
+        pending = list(self._inflight_tasks)
+        if not pending:
+            return
+        log.info("draining in-flight tasks", extra={"count": len(pending), "timeout": drain_timeout})
+        _, still_running = await asyncio.wait(pending, timeout=drain_timeout)
+        if not still_running:
+            return
+        # 3. Time's up — fire each cancel hook to kill omp; tasks will hit
+        #    the shutting_down branch in _run_event and exit without
+        #    marking the row failed.
+        log.warning("shutdown timeout; killing omp subprocesses", extra={"count": len(still_running)})
+        for task in still_running:
+            delivery_id = self._inflight_tasks.get(task)
+            if delivery_id is None:
+                continue
+            hook = self._cancel_hooks.pop(delivery_id, None)
+            if hook is None:
+                continue
+            try:
+                await asyncio.to_thread(hook)
+            except Exception:
+                log.exception("shutdown hook raised", extra={"delivery": delivery_id})
+        # 4. Brief wait for the exception path to settle.
+        with suppress(TimeoutError):
+            await asyncio.wait(still_running, timeout=kill_timeout)
 
     async def _dispatch_loop(self) -> None:
         log.info("dispatch loop online")
@@ -84,7 +128,9 @@ class WorkerPool:
                         pass
                     continue
                 # Schedule the task; the semaphore caps concurrent execution.
-                asyncio.create_task(self._run_event(row), name=f"robomp-event-{row.delivery_id[:8]}")
+                task = asyncio.create_task(self._run_event(row), name=f"robomp-event-{row.delivery_id[:8]}")
+                self._inflight_tasks[task] = row.delivery_id
+                task.add_done_callback(lambda t: self._inflight_tasks.pop(t, None))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -161,7 +207,17 @@ class WorkerPool:
                 else:
                     self.db.mark_event(row.delivery_id, "done")
             except Exception as exc:
-                if row.delivery_id in self._cancelled:
+                if self._shutting_down:
+                    # Phase B: leave the row in `running` so
+                    # `reset_stuck_running()` flips it back to `queued` on
+                    # the next start and the resumed omp session picks up
+                    # via `--continue`. Marking failed here would strand
+                    # work that we know is recoverable.
+                    log.info(
+                        "event interrupted by shutdown",
+                        extra={"delivery": row.delivery_id, "key": row.issue_key},
+                    )
+                elif row.delivery_id in self._cancelled:
                     log.info("event cancelled", extra={"delivery": row.delivery_id})
                     self.db.mark_event(row.delivery_id, "failed", error="cancelled by operator")
                 else:
@@ -179,7 +235,14 @@ class WorkerPool:
         action = str(row.payload.get("action") or "")
         log.info(
             "dispatch",
-            extra={"event": event, "action": action, "delivery": row.delivery_id, "key": row.issue_key},
+            extra={
+                "event": event,
+                "action": action,
+                "delivery": row.delivery_id,
+                "key": row.issue_key,
+                "attempts": row.attempts,
+                "recovered": row.attempts >= 2,
+            },
         )
         if event == "issues" and action == "opened":
             await tasks.triage_issue(
@@ -187,8 +250,10 @@ class WorkerPool:
                 db=self.db,
                 github=self.github,
                 sandbox=self.sandbox,
+                git_transport=self.git_transport,
                 payload=row.payload,
                 delivery_id=row.delivery_id,
+                attempts=row.attempts,
             )
         elif event == "issue_comment" and action == "created":
             issue = row.payload.get("issue") or {}
@@ -198,8 +263,10 @@ class WorkerPool:
                     db=self.db,
                     github=self.github,
                     sandbox=self.sandbox,
+                    git_transport=self.git_transport,
                     payload=row.payload,
                     delivery_id=row.delivery_id,
+                    attempts=row.attempts,
                 )
             else:
                 await tasks.handle_comment(
@@ -207,8 +274,10 @@ class WorkerPool:
                     db=self.db,
                     github=self.github,
                     sandbox=self.sandbox,
+                    git_transport=self.git_transport,
                     payload=row.payload,
                     delivery_id=row.delivery_id,
+                    attempts=row.attempts,
                 )
         elif event == "pull_request_review_comment" and action == "created":
             await tasks.handle_review(
@@ -216,8 +285,10 @@ class WorkerPool:
                 db=self.db,
                 github=self.github,
                 sandbox=self.sandbox,
+                git_transport=self.git_transport,
                 payload=row.payload,
                 delivery_id=row.delivery_id,
+                attempts=row.attempts,
             )
         elif event == "issues" and action == "closed":
             await tasks.cleanup_workspace(
