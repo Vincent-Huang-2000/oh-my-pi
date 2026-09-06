@@ -53,7 +53,7 @@ New request primary; existing plan reference only. NEVER reconcile old plan whil
 2. Read existing plan only as reference.
 3. Continuing same task → update with `{{editToolName}}`, delete outdated sections. Different task → retain old plan; create fresh `local://<slug>-plan.md`.
 4. If unfinished/broken old work is required by new request, incorporate corrections INTO new plan; combine, NEVER replace new request with old fix.
-5. Decision-complete new request → call `resolve` with `action: "apply"` and `extra: { title }`.
+5. Decision-complete new request → write the plan `<slug>`/title, plain text, to `xd://propose` for approval.
 </procedure>
 {{/if}}
 

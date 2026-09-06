@@ -105,6 +105,8 @@ function sessionNotification(value: unknown): boolean {
 			return typeof update.toolCallId === "string";
 		case "plan":
 			return Array.isArray(update.entries);
+		case "plan_review_update":
+			return update.review === null || (typeof update.review === "object" && update.review !== null);
 		case "current_mode_update":
 			return typeof update.currentModeId === "string";
 		case "available_commands_update":

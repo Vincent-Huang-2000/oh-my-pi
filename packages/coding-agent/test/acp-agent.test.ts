@@ -306,7 +306,14 @@ class FakeAgentSession {
 		await this.sessionManager.setSessionFile(sessionPath);
 		this.sessionId = this.sessionManager.getSessionId();
 		this.agent.sessionId = this.sessionId;
+		await this.sessionSwitchReconciler?.();
 		return true;
+	}
+
+	sessionSwitchReconciler: (() => Promise<void>) | undefined;
+
+	setSessionSwitchReconciler(reconciler: (() => Promise<void>) | null): void {
+		this.sessionSwitchReconciler = reconciler ?? undefined;
 	}
 
 	async dispose(): Promise<void> {
@@ -361,11 +368,51 @@ class FakeAgentSession {
 		return this.planProposalHandler;
 	}
 
-	planReferencePath: string | undefined;
-
 	setPlanReferencePath(path: string): void {
 		this.planReferencePath = path;
 	}
+
+	planReferenceSent = false;
+	markPlanReferenceSentCalls = 0;
+
+	markPlanReferenceSent(): void {
+		this.markPlanReferenceSentCalls++;
+		this.planReferenceSent = true;
+	}
+
+	markPlanInternalAbortPendingCalls = 0;
+	clearPlanInternalAbortPendingCalls = 0;
+
+	markPlanInternalAbortPending(): void {
+		this.markPlanInternalAbortPendingCalls++;
+	}
+
+	clearPlanInternalAbortPending(): void {
+		this.clearPlanInternalAbortPendingCalls++;
+	}
+
+	applyRoleModelCalls: Array<{ role: string }> = [];
+
+	async applyRoleModel(entry: { role: string }): Promise<void> {
+		this.applyRoleModelCalls.push(entry);
+	}
+
+	getRoleModelCycle(): undefined {
+		return undefined;
+	}
+
+	compactCalls: Array<{ instructions: string | undefined; options: unknown }> = [];
+
+	async compact(instructions?: string, options?: unknown): Promise<void> {
+		this.compactCalls.push({ instructions, options });
+	}
+
+	followUpCalls: string[] = [];
+
+	async followUp(text: string): Promise<void> {
+		this.followUpCalls.push(text);
+	}
+	planReferencePath: string | undefined;
 
 	getToolByName(_name: string): undefined {
 		return undefined;
@@ -392,8 +439,6 @@ class FakeAgentSession {
 	async sendCustomMessage(_message: string, _options?: unknown): Promise<void> {}
 
 	async sendUserMessage(_content: string, _options?: unknown): Promise<void> {}
-
-	async compact(_instructions?: string, _options?: unknown): Promise<void> {}
 
 	async fork(): Promise<boolean> {
 		await this.sessionManager.flush();

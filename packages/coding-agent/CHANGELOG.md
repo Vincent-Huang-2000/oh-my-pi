@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the `omp.planReview` v1 ACP plan-review extension: form-capable ACP clients now get a full five-option review (approve with a fresh session, compact, or keep context; refine with feedback; save and quit) with execution-model selection, a `plan_review_update` session update carrying the review content, `omp.planReview/reopen` and `omp.planReview/action` extension methods, and pending-review restoration when a session reloads.
+- ACP sessions now report `omp.planMode`/`omp.planReview` snapshots in `_meta` on session creation, load, resume, fork, and mode changes.
+
 ## [18.1.5] - 2026-09-03
 
 ### Added

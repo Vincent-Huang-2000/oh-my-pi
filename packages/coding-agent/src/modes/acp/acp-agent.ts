@@ -1,8 +1,9 @@
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { AgentBusyError, type AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
-import { getBlobsDir, isEnoent, logger, type postmortem, VERSION } from "@oh-my-pi/pi-utils";
+import { getBlobsDir, isEnoent, logger, type postmortem, prompt, VERSION } from "@oh-my-pi/pi-utils";
 import {
 	type Agent,
 	type AgentSideConnection,
@@ -33,6 +34,8 @@ import {
 	RequestError,
 	type ResumeSessionRequest,
 	type ResumeSessionResponse,
+	type PlanReviewExecutionModel,
+	type PlanReviewSessionUpdate,
 	type SessionConfigOption,
 	type SessionInfo,
 	type SessionModeState,
@@ -48,6 +51,7 @@ import { disableProvider, enableProvider, reset as resetCapabilities } from "../
 import { Settings } from "../../config/settings";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
+	type ContextUsage,
 	type ExtensionUIContext,
 	type ExtensionUIDialogOptions,
 	getExtensionUISelectOptionLabel,
@@ -56,13 +60,16 @@ import { runExtensionCompact } from "../../extensibility/extensions/compact-hand
 import { getSessionSlashCommands } from "../../extensibility/extensions/get-commands-handler";
 import { buildSkillPromptMessage, parseSkillInvocation } from "../../extensibility/skills";
 import { loadSlashCommands } from "../../extensibility/slash-commands";
-import { resolveLocalUrlToPath } from "../../internal-urls";
+import { parseSlashCommand } from "../../slash-commands/helpers/parse";
+import { copyLocalArtifacts, resolveLocalUrlToPath } from "../../internal-urls";
 import { MCPManager } from "../../mcp/manager";
 import type { MCPServerConfig } from "../../mcp/types";
 import { loadAllExtensions } from "../../modes/components/extensions/state-manager";
 import { theme } from "../../modes/theme/theme";
 import { normalizePlanTitle, type PlanApprovalDetails, resolveApprovedPlan } from "../../plan-mode/approved-plan";
-import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
+import planModeApprovedPrompt from "../../prompts/system/plan-mode-approved.md" with { type: "text" };
+import planModeCompactInstructionsPrompt from "../../prompts/system/plan-mode-compact-instructions.md" with { type: "text" };
+import type { AgentSession, AgentSessionEvent, ResolvedRoleModel } from "../../session/agent-session";
 import { BlobStore, resolveImageDataSync } from "../../session/blob-store";
 import { isSilentAbort, SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
 import type { UsageStatistics } from "../../session/session-entries";
@@ -74,7 +81,7 @@ import { DEFAULT_STT_MODEL_KEY, STT_MODEL_OPTIONS } from "../../stt/models";
 import { refreshAgentDiscovery } from "../../task";
 import { AUTO_THINKING, parseConfiguredThinkingLevel } from "../../thinking";
 import { OTHER_OPTION } from "../../tools/ask";
-import { normalizeLocalScheme } from "../../tools/path-utils";
+import { normalizeLocalScheme, resolveToCwd } from "../../tools/path-utils";
 import { ToolError } from "../../tools/tool-errors";
 import {
 	DEFAULT_TTS_LOCAL_MODEL_KEY,
@@ -89,13 +96,22 @@ import {
 	mapAgentSessionEventToAcpSessionUpdates,
 	normalizeReplayToolArguments,
 } from "./acp-event-mapper";
+import {
+	PLAN_REVIEW_STATE_FILE_NAME,
+	parsePlanReviewAction,
+	parsePlanReviewState,
+	planReviewExecutionModels,
+	planReviewOptions,
+	type AcpPlanReviewDecision,
+	type AcpPlanReviewState,
+	type PlanReviewOutcome,
+} from "./acp-plan-review";
+import type { PlanReviewOption } from "@oh-my-pi/pi-utils/acp";
 import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
 
 const ACP_DEFAULT_MODE_ID = "default";
 const ACP_PLAN_MODE_ID = "plan";
 const DEFAULT_PLAN_FILE_URL = "local://PLAN.md";
-const APPROVE_OPTION = "Approve and execute";
-const REFINE_OPTION = "Refine plan";
 const MODE_CONFIG_ID = "mode";
 const MODEL_CONFIG_ID = "model";
 const THINKING_CONFIG_ID = "thinking";
@@ -173,6 +189,9 @@ type ManagedSessionRecord = {
 	mcpRefreshChain: Promise<void> | undefined;
 	promptTurn: PromptTurnState | undefined;
 	promptQueue: PromptQueueState;
+
+	/** Plan-review decision awaiting execution at the current turn's end. */
+	pendingPlanOutcome: PlanReviewOutcome | undefined;
 	liveMessageId: string | undefined;
 	liveMessageProgress: { textEmitted: boolean; thoughtEmitted: boolean } | undefined;
 	toolArgsById: Map<string, unknown>;
@@ -692,6 +711,7 @@ export class AcpAgent implements Agent {
 			sessionId: record.session.sessionId,
 			configOptions: this.#buildConfigOptions(record.session),
 			modes: this.#buildModeState(record.session),
+			_meta: await this.#buildSessionMeta(record.session),
 		};
 		this.#scheduleBootstrapUpdates(record.session.sessionId);
 		return response;
@@ -704,6 +724,7 @@ export class AcpAgent implements Agent {
 		const response: LoadSessionResponse = {
 			configOptions: this.#buildConfigOptions(record.session),
 			modes: this.#buildModeState(record.session),
+			_meta: await this.#buildSessionMeta(record.session),
 		};
 		this.#scheduleBootstrapUpdates(record.session.sessionId);
 		return response;
@@ -732,6 +753,7 @@ export class AcpAgent implements Agent {
 		const response: ResumeSessionResponse = {
 			configOptions: this.#buildConfigOptions(record.session),
 			modes: this.#buildModeState(record.session),
+			_meta: await this.#buildSessionMeta(record.session),
 		};
 		this.#scheduleBootstrapUpdates(record.session.sessionId);
 		return response;
@@ -744,6 +766,7 @@ export class AcpAgent implements Agent {
 			sessionId: record.session.sessionId,
 			configOptions: this.#buildConfigOptions(record.session),
 			modes: this.#buildModeState(record.session),
+			_meta: await this.#buildSessionMeta(record.session),
 		};
 		this.#scheduleBootstrapUpdates(record.session.sessionId);
 		return response;
@@ -760,13 +783,13 @@ export class AcpAgent implements Agent {
 
 	async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
 		const record = this.#getSessionRecord(params.sessionId);
-		this.#applyModeChange(record.session, params.modeId);
+		this.#applyModeChange(record, params.modeId);
 		await this.#connection.sessionUpdate({
 			sessionId: record.session.sessionId,
 			update: this.#buildCurrentModeUpdate(record.session),
 		});
 		await this.#pushConfigOptionUpdate(record);
-		return {};
+		return { _meta: await this.#buildSessionMeta(record.session) };
 	}
 
 	async setSessionConfigOption(params: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
@@ -777,7 +800,7 @@ export class AcpAgent implements Agent {
 
 		switch (params.configId) {
 			case MODE_CONFIG_ID:
-				this.#applyModeChange(record.session, params.value);
+				this.#applyModeChange(record, params.value);
 				break;
 			case MODEL_CONFIG_ID:
 				await this.#setModelById(record.session, params.value);
@@ -961,6 +984,19 @@ export class AcpAgent implements Agent {
 	async #runPromptOrCommand(record: ManagedSessionRecord, text: string, images: AgentImageContent[]): Promise<void> {
 		const skillResult = await this.#tryRunSkillCommand(record, text);
 		if (skillResult) {
+			return;
+		}
+		const planReviewHandled = await this.#tryRunPlanReviewCommand(record, text);
+		if (planReviewHandled) {
+			const promptTurn = record.promptTurn;
+			this.#finishPrompt(record, {
+				stopReason: "end_turn",
+				usage: this.#buildTurnUsage(
+					promptTurn?.usageBaseline ??
+						this.#cloneUsageStatistics(record.session.sessionManager.getUsageStatistics()),
+					record.session.sessionManager.getUsageStatistics(),
+				),
+			});
 			return;
 		}
 
@@ -1194,6 +1230,60 @@ export class AcpAgent implements Agent {
 				enableProvider(providerId);
 				return { enabled: true };
 			}
+			case "omp.planReview/reopen": {
+				const record = this.#getPlanReviewRecord(params);
+				const state = await this.#readPlanReviewState(record.session);
+				if (!state) {
+					return { ok: false, error: "No pending plan review for this session." };
+				}
+				const content = await this.#readAcpPlanFile(record.session, state.planFilePath);
+				if (content === null) {
+					await this.#deletePlanReviewState(record.session);
+					return { ok: false, error: "The plan file for the pending review no longer exists." };
+				}
+				await this.#emitPlanReviewUpdate(record.session, {
+					reviewId: state.reviewId,
+					planFilePath: state.planFilePath,
+					title: state.title,
+					planExists: true,
+					content,
+					feedback: state.feedback,
+					options: planReviewOptions(record.session.getContextUsage()),
+					executionModels: this.#buildExecutionModelOptions(record.session),
+					context: this.#buildPlanReviewContext(record.session),
+				});
+				return { ok: true, reviewId: state.reviewId };
+			}
+			case "omp.planReview/action": {
+				const record = this.#getPlanReviewRecord(params);
+				const decision = parsePlanReviewAction(params);
+				if (!decision) {
+					return { ok: false, error: "Invalid plan review action." };
+				}
+				if (decision.kind === "invalid") {
+					return { ok: false, error: decision.reason };
+				}
+				const state = await this.#readPlanReviewState(record.session);
+				if (
+					!state ||
+					(typeof params.reviewId === "string" && params.reviewId && params.reviewId !== state.reviewId)
+				) {
+					return { ok: false, error: "No pending plan review matches the supplied review id." };
+				}
+				const content = await this.#readAcpPlanFile(record.session, state.planFilePath);
+				if (content === null) {
+					return { ok: false, error: "The plan file for the pending review no longer exists." };
+				}
+				const outcome: PlanReviewOutcome = {
+					...decision,
+					reviewId: state.reviewId,
+					planFilePath: state.planFilePath,
+					title: state.title,
+					content,
+				};
+				await this.#runPlanReviewAction(record, outcome);
+				return { ok: true };
+			}
 			default:
 				throw new Error(`Unknown ACP ext method: ${method}`);
 		}
@@ -1323,10 +1413,20 @@ export class AcpAgent implements Agent {
 		session.setClientBridge(createAcpClientBridge(this.#connection, session.sessionId, this.#clientCapabilities));
 		// `record.lifetimeUnsubscribe` is installed in `#scheduleBootstrapUpdates`
 		// so it shares the bootstrap race guard — see that comment for why.
+		// Restore a pending plan review (and plan mode) whenever this session
+		// switches files — `#openStoredSession` and `#forkManagedSession` both
+		// route through `session.switchSession`, which invokes the reconciler.
+		session.setSessionSwitchReconciler?.(() => this.#reconcilePlanModeFromSession(record));
 		try {
 			await this.#configureExtensions(record);
 			await this.#configureMcpServers(record, mcpServers);
 			this.#sessions.set(session.sessionId, record);
+			// Restore a pending plan review immediately: for loaded sessions the
+			// reconciler registered above never fires on the initial switch —
+			// it is installed after `#openStoredSession`'s `switchSession` — so
+			// the load-time restore must run here. Fresh sessions find no state
+			// and stay in the default mode.
+			await this.#reconcilePlanModeFromSession(record);
 			return record;
 		} catch (error) {
 			await this.#disposeSessionRecord(record);
@@ -1344,14 +1444,15 @@ export class AcpAgent implements Agent {
 			mcpManager: undefined,
 			mcpRefreshChain: undefined,
 			promptTurn: undefined,
+			pendingPlanOutcome: undefined,
 			promptQueue: { promise: Promise.resolve(), release: undefined },
 			liveMessageId: undefined,
 			liveMessageProgress: undefined,
 			toolArgsById: new Map(),
 			extensionsConfigured: false,
 			closedError: undefined,
-			promptEventHandlers: new Set(),
 			extensionUserMessageTasks: new Set(),
+			promptEventHandlers: new Set(),
 			lifetimeUnsubscribe: undefined,
 		};
 	}
@@ -1462,10 +1563,23 @@ export class AcpAgent implements Agent {
 			await this.#flushUnreportedTurnError(record, event);
 			await this.#emitEndOfTurnUpdates(record);
 			await this.#waitForAcpPromptIdle(record);
+			// A deferred plan-review outcome (fresh session, compaction, model
+			// switch, save-and-quit) runs here: the turn has settled, the
+			// session is idle, and the prompt-turn subscription is still alive
+			// so the synthetic execution turn streams to the client.
+			const pendingOutcome = record.pendingPlanOutcome;
+			record.pendingPlanOutcome = undefined;
+			if (pendingOutcome) {
+				try {
+					await this.#executePlanReviewOutcome(record.session, pendingOutcome);
+				} catch (error) {
+					logger.warn("ACP plan review outcome failed", { sessionId: record.session.sessionId, error });
+				}
+			}
 			record.liveMessageId = undefined;
 			record.liveMessageProgress = undefined;
 			this.#finishPrompt(record, {
-				stopReason: this.#resolveStopReason(event, promptTurn.cancelRequested),
+				stopReason: pendingOutcome ? "end_turn" : this.#resolveStopReason(event, promptTurn.cancelRequested),
 				usage: this.#buildTurnUsage(promptTurn.usageBaseline, record.session.sessionManager.getUsageStatistics()),
 			});
 		}
@@ -1839,27 +1953,37 @@ export class AcpAgent implements Agent {
 		return session.getPlanModeState()?.enabled ? ACP_PLAN_MODE_ID : ACP_DEFAULT_MODE_ID;
 	}
 
-	#applyModeChange(session: AgentSession, modeId: string): void {
+	#applyModeChange(record: ManagedSessionRecord, modeId: string): void {
+		const session = record.session;
 		const availableModes = this.#getAvailableModes(session);
 		if (!availableModes.some(mode => mode.id === modeId)) {
 			throw new Error(`Unsupported ACP mode: ${modeId}`);
 		}
 		if (modeId === ACP_PLAN_MODE_ID) {
 			const previous = session.getPlanModeState();
+			const planFilePath = previous?.planFilePath ?? DEFAULT_PLAN_FILE_URL;
 			session.setPlanModeState({
 				enabled: true,
-				planFilePath: previous?.planFilePath ?? DEFAULT_PLAN_FILE_URL,
+				planFilePath,
 				workflow: previous?.workflow ?? "parallel",
 				reentry: previous !== undefined,
 			});
 			// Mirror `InteractiveMode.#enterPlanMode`: register the plan-proposal
-			// handler that consumes `xd://propose` writes from plan mode. Without
-			// this, proposal dispatch falls through and plan mode has no approval
-			// path (issue #1869).
+			// handler that consumes `xd://propose` writes from plan mode, and
+			// journal the mode change so other hosts restore it. Without the
+			// handler, proposal dispatch falls through and plan mode has no
+			// approval path (issue #1869).
 			session.setPlanProposalHandler?.(title => this.#handleAcpPlanProposal(session, title));
+			session.sessionManager.appendModeChange(ACP_PLAN_MODE_ID, { planFilePath });
 		} else {
 			session.setPlanProposalHandler?.(null);
 			session.setPlanModeState(undefined);
+			session.sessionManager.appendModeChange("none");
+			// An explicit mode exit also consumes any pending review: the
+			// deferred approval outcome never runs and the persisted review
+			// state is gone, so a reload cannot resurrect plan mode.
+			record.pendingPlanOutcome = undefined;
+			void this.#deletePlanReviewState(session);
 		}
 	}
 
@@ -1867,14 +1991,17 @@ export class AcpAgent implements Agent {
 	 * Plan-proposal handler installed while ACP plan mode is active. The agent
 	 * submits the finalized plan by writing its `<slug>`/title to
 	 * `xd://propose`; this handler validates the plan file, normalizes the
-	 * title, asks the ACP client to confirm (via `unstable_createElicitation`
-	 * when supported), and on approval keeps the chosen plan path, exits plan
-	 * mode, and notifies the client so the agent regains full tools.
+	 * title, and drives the plan review (see `acp-plan-review.ts`):
 	 *
-	 * Mirrors `InteractiveMode.#handlePlanProposal` for the parts the agent sees
-	 * (same `PlanApprovalDetails` shape). Clients without form-mode elicitation
-	 * get an auto-approve so plan mode is never stranded — the agent always has
-	 * a way out.
+	 * - form-capable clients get the full five-option review elicitation plus
+	 *   a `plan_review_update` describing the review content;
+	 * - clients without form-mode elicitation auto-approve with keep-context
+	 *   semantics so plan mode is never stranded;
+	 * - dismissal/cancel falls through to refine semantics — plan mode stays
+	 *   active and write access is never granted implicitly;
+	 * - approve/save strategies that must run on an idle session (fresh
+	 *   session, compaction, model switch, save-and-quit) are deferred to the
+	 *   current turn's end via `record.pendingPlanOutcome`.
 	 */
 	async #handleAcpPlanProposal(session: AgentSession, title: string): Promise<AgentToolResult<unknown>> {
 		const state = session.getPlanModeState();
@@ -1891,20 +2018,53 @@ export class AcpAgent implements Agent {
 			readPlan: url => this.#readAcpPlanFile(session, url),
 			listPlanFiles: () => this.#listAcpLocalPlanFiles(session),
 		});
-		const approved = await this.#requestAcpPlanApprovalChoice(session.sessionId, resolvedTitle, planContent);
+		// Promote the reviewed path into plan-mode state so the next
+		// `#buildPlanModeMessage()` targets the plan just reviewed, not the
+		// stale state path.
+		if (state.planFilePath !== planFilePath) {
+			session.setPlanModeState({ ...state, planFilePath });
+		}
+		const reviewId = crypto.randomUUID();
+		await this.#writePlanReviewState(session, {
+			version: 1,
+			reviewId,
+			planFilePath,
+			title: resolvedTitle,
+			planExists: true,
+			feedback: "",
+		});
+		const supportsForm = this.#clientCapabilities?.elicitation?.form != null;
 		const details: PlanApprovalDetails = {
 			planFilePath,
 			title: resolvedTitle,
 			planExists: true,
 		};
-		if (!approved) {
-			// Rejection keeps plan mode active for another planning turn. Promote the
-			// reviewed path into plan-mode state so the next `#buildPlanModeMessage()`
-			// targets the plan just reviewed, not the stale state path.
-			if (state.planFilePath !== planFilePath) {
-				session.setPlanModeState({ ...state, planFilePath });
-			}
-			const normalizedTitle = normalizePlanTitle(resolvedTitle).title;
+		if (supportsForm) {
+			await this.#emitPlanReviewUpdate(session, {
+				reviewId,
+				planFilePath,
+				title: resolvedTitle,
+				planExists: true,
+				content: planContent,
+				feedback: "",
+				options: planReviewOptions(session.getContextUsage()),
+				executionModels: this.#buildExecutionModelOptions(session),
+				context: this.#buildPlanReviewContext(session),
+			});
+		}
+		const decision = await this.#requestAcpPlanReviewChoice(
+			session.sessionId,
+			resolvedTitle,
+			planContent,
+			planReviewOptions(session.getContextUsage()),
+			this.#buildExecutionModelOptions(session),
+		);
+		const normalizedTitle = normalizePlanTitle(resolvedTitle).title;
+		if (!decision || decision.kind === "cancel") {
+			// Dismissal keeps plan mode active for another planning turn —
+			// closing the dialog can never grant write access.
+			await this.#deletePlanReviewState(session);
+			if (supportsForm) await this.#emitPlanReviewClosed(session);
 			return {
 				content: [
 					{
@@ -1915,33 +2075,211 @@ export class AcpAgent implements Agent {
 				details,
 			};
 		}
-		// Approved. Set the plan reference so the next turn injects the plan
-		// content as context (the file keeps its agent-chosen name — no rename),
-		// then exit plan mode so the agent regains full tools.
-		session.setPlanReferencePath(planFilePath);
-		session.setPlanProposalHandler?.(null);
-		session.setPlanModeState(undefined);
-		try {
-			await this.#connection.sessionUpdate({
-				sessionId: session.sessionId,
-				update: this.#buildCurrentModeUpdate(session),
-			});
-			await this.#pushConfigOptionUpdateForSession(session);
-		} catch (error) {
-			logger.warn("Failed to emit mode updates after plan approval", {
-				sessionId: session.sessionId,
-				error,
-			});
+		if (decision.kind === "invalid") {
+			// A malformed client payload (e.g. save without a path) must not
+			// approve anything. The review state stays so the client can retry
+			// through the reopen flow.
+			if (supportsForm) await this.#emitPlanReviewClosed(session);
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text: `${decision.reason} Plan mode stays active; reopen the review and retry.`,
+					},
+				],
+				details,
+			};
 		}
+		if (decision.kind === "refine") {
+			if (decision.editedContent !== undefined) {
+				await this.#writePlanContent(session, planFilePath, decision.editedContent);
+			}
+			if (decision.feedback.length > 0) {
+				await this.#writePlanReviewState(session, {
+					version: 1,
+					reviewId,
+					planFilePath,
+					title: resolvedTitle,
+					planExists: true,
+					feedback: decision.feedback,
+				});
+			}
+			if (supportsForm) await this.#emitPlanReviewClosed(session);
+			const feedbackBlock = decision.feedback.trim() ? `\n\nFeedback:\n${decision.feedback.trim()}` : "";
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text: `Plan refinement requested.${feedbackBlock}\n\nUpdate the plan file, then write ${normalizedTitle} to xd://propose again when ready.`,
+					},
+				],
+				details,
+			};
+		}
+		if (
+			decision.kind === "approve" &&
+			decision.strategy === "keep" &&
+			decision.executionModel === undefined &&
+			decision.editedContent === undefined
+		) {
+			// Plain keep-context approval continues in the current turn —
+			// the existing inline ACP behavior.
+			session.setPlanReferencePath(planFilePath);
+			await this.#exitPlanModeForApproval(session);
+			await this.#deletePlanReviewState(session);
+			if (supportsForm) await this.#emitPlanReviewClosed(session);
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text: `Plan approved at ${planFilePath}. Plan mode exited; proceed with the implementation.`,
+					},
+				],
+				details,
+			};
+		}
+		// Approval strategies that must run on an idle session (fresh session,
+		// compaction, execution-model switch, save-and-quit): defer execution
+		// to the end of the current turn. The pending outcome runs from the
+		// `agent_end` branch of `#handlePromptEvent`, while the prompt turn is
+		// still subscribed, so the synthetic execution turn streams to the
+		// client. The turn is aborted silently (mirroring the TUI's
+		// plan-approval abort) because the model must not continue planning
+		// while the outcome is pending.
+		const outcome: PlanReviewOutcome = {
+			...decision,
+			reviewId,
+			planFilePath,
+			title: resolvedTitle,
+			content: planContent,
+		};
+		const record = this.#sessions.get(session.sessionId);
+		if (record && session.isStreaming) {
+			record.pendingPlanOutcome = outcome;
+			session.markPlanInternalAbortPending?.();
+			void session
+				.abort()
+				.catch((error: unknown) => {
+					logger.warn("ACP plan review abort failed", { sessionId: session.sessionId, error });
+				})
+				.finally(() => {
+					session.clearPlanInternalAbortPending?.();
+				});
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text:
+							decision.kind === "save"
+								? "Plan saved; starting a new session after this turn."
+								: "Plan approved; execution starts after this turn.",
+					},
+				],
+				details,
+			};
+		}
+		await this.#executePlanReviewOutcome(session, outcome);
 		return {
 			content: [
 				{
 					type: "text" as const,
-					text: `Plan approved at ${planFilePath}. Plan mode exited; proceed with the implementation.`,
+					text:
+						decision.kind === "save"
+							? "Plan saved; starting a new session."
+							: "Plan approved; proceeding with execution.",
 				},
 			],
 			details,
 		};
+	}
+
+	/** Ask the ACP client to decide the plan review. Clients without
+	 *  form-mode elicitation auto-approve with keep-context semantics because
+	 *  there is no confirmation surface available; without that, plan mode
+	 *  would strand the agent. Dismissal and unrecognized values yield
+	 *  `undefined`, which the caller treats as cancel-with-refine semantics —
+	 *  closing the dialog can never grant write access. */
+	async #requestAcpPlanReviewChoice(
+		sessionId: string,
+		title: string,
+		planContent: string,
+		options: PlanReviewOption[],
+		executionModels: PlanReviewExecutionModel[] | undefined,
+	): Promise<AcpPlanReviewDecision | undefined> {
+		const supportsForm = this.#clientCapabilities?.elicitation?.form != null;
+		if (!supportsForm) return { kind: "approve", strategy: "keep" };
+		// Include a short preview of the plan so thin clients have context in
+		// the dialog. Keep the body bounded — Zed renders elicitation messages
+		// inline and a multi-thousand-line plan blows out the dialog.
+		const previewLines = planContent.split("\n").slice(0, 12).join("\n");
+		const ellipsis = planContent.split("\n").length > 12 ? "\n…" : "";
+		const message = `Review plan "${title}" and choose how to proceed.\n\n${previewLines}${ellipsis}`;
+		const properties: Record<string, ElicitationPropertySchema> = {
+			decision: {
+				type: "string",
+				title: "Review decision",
+				oneOf: options
+					.filter(option => !option.disabled)
+					.map(option => ({
+						const: option.id,
+						title: option.label,
+						...(option.description ? { description: option.description } : {}),
+					})),
+			},
+			feedback: { type: "string", title: "Feedback", description: "Sent to the agent when refining the plan." },
+			savePath: {
+				type: "string",
+				title: "Save path",
+				description: "Workspace-relative file path; required for Save and quit.",
+			},
+			editedContent: {
+				type: "string",
+				title: "Edited plan",
+				description: "Full updated plan content when the review UI edited the plan.",
+			},
+		};
+		if (executionModels && executionModels.length > 0) {
+			properties.executionModel = {
+				type: "string",
+				title: "Execution model",
+				description: "Model that executes the approved plan (default: current session model).",
+				enum: executionModels.map(model => model.id),
+			};
+		}
+		const content = await elicitFormFromAcpClient(
+			this.#connection,
+			sessionId,
+			"select",
+			message,
+			properties,
+			undefined,
+			undefined,
+		);
+		return parsePlanReviewAction(content);
+	}
+
+	#buildExecutionModelOptions(session: AgentSession): PlanReviewExecutionModel[] | undefined {
+		return planReviewExecutionModels(session.getRoleModelCycle(session.settings.get("cycleOrder")));
+	}
+
+	#buildPlanReviewContext(session: AgentSession): { tokens: number; contextWindow: number } | undefined {
+		const usage: ContextUsage | undefined = session.getContextUsage();
+		return usage ? { tokens: usage.tokens, contextWindow: usage.contextWindow } : undefined;
+	}
+
+	async #applyExecutionModelChoice(session: AgentSession, executionModel: string | undefined): Promise<void> {
+		if (!executionModel) return;
+		const cycle = session.getRoleModelCycle(session.settings.get("cycleOrder"));
+		const entry: ResolvedRoleModel | undefined = cycle?.models.find(candidate => candidate.role === executionModel);
+		if (!entry) {
+			logger.warn("ACP plan review execution model not found", { executionModel });
+			return;
+		}
+		try {
+			await session.applyRoleModel(entry);
+		} catch (error) {
+			logger.warn("ACP plan review execution model apply failed", { executionModel, error });
+		}
 	}
 
 	#resolveAcpPlanFilePath(session: AgentSession, planFilePath: string): string {
@@ -1987,36 +2325,320 @@ export class AcpAgent implements Agent {
 		}
 	}
 
-	/**
-	 * Ask the ACP client to confirm plan approval. Returns `true` only on an
-	 * explicit `APPROVE_OPTION` selection. Refine, dismissal (`undefined`), or
-	 * any unrecognized value falls through to refine semantics — the caller
-	 * keeps plan mode active and surfaces guidance text to the agent. Clients
-	 * without `elicitation.form` support auto-approve because there is no
-	 * confirmation surface available; without that, plan mode would strand
-	 * the agent (the bug this method exists to fix).
-	 */
-	async #requestAcpPlanApprovalChoice(sessionId: string, title: string, planContent: string): Promise<boolean> {
-		const supportsForm = this.#clientCapabilities?.elicitation?.form != null;
-		if (!supportsForm) return true;
-		// Include a short preview of the plan so the user has context in the
-		// dialog. Keep the body bounded — Zed renders elicitation messages
-		// inline and a multi-thousand-line plan blows out the dialog.
-		const previewLines = planContent.split("\n").slice(0, 12).join("\n");
-		const ellipsis = planContent.split("\n").length > 12 ? "\n…" : "";
-		const message = `Approve plan "${title}" and start implementation?\n\n${previewLines}${ellipsis}`;
-		const value = await elicitFromAcpClient(
-			this.#connection,
-			sessionId,
-			"select",
-			message,
-			{ type: "string", enum: [APPROVE_OPTION, REFINE_OPTION] },
-			undefined,
+	async #readPlanReviewState(session: AgentSession): Promise<AcpPlanReviewState | null> {
+		try {
+			const data = await Bun.file(
+				this.#resolveAcpPlanFilePath(session, `local://${PLAN_REVIEW_STATE_FILE_NAME}`),
+			).json();
+			return parsePlanReviewState(data);
+		} catch (error) {
+			if (isEnoent(error)) return null;
+			logger.warn("ACP plan-review state read failed", { sessionId: session.sessionId, error });
+			return null;
+		}
+	}
+
+	async #writePlanReviewState(session: AgentSession, state: AcpPlanReviewState): Promise<void> {
+		await Bun.write(
+			this.#resolveAcpPlanFilePath(session, `local://${PLAN_REVIEW_STATE_FILE_NAME}`),
+			JSON.stringify(state, null, 2),
 		);
-		// Approve ONLY on the explicit approve selection. Dismissal, cancel,
-		// timeout, or any other non-approve response falls through to refine
-		// semantics so closing the dialog can never grant write access.
-		return value === APPROVE_OPTION;
+	}
+
+	async #deletePlanReviewState(session: AgentSession): Promise<void> {
+		try {
+			await fs.rm(this.#resolveAcpPlanFilePath(session, `local://${PLAN_REVIEW_STATE_FILE_NAME}`), {
+				force: true,
+			});
+		} catch (error) {
+			if (!isEnoent(error)) {
+				logger.warn("ACP plan-review state delete failed", { sessionId: session.sessionId, error });
+			}
+		}
+	}
+
+	async #writePlanContent(session: AgentSession, planFilePath: string, content: string): Promise<void> {
+		await Bun.write(this.#resolveAcpPlanFilePath(session, planFilePath), content);
+	}
+
+	async #emitPlanReviewUpdate(session: AgentSession, review: PlanReviewSessionUpdate): Promise<void> {
+		await this.#connection.sessionUpdate({
+			sessionId: session.sessionId,
+			update: { sessionUpdate: "plan_review_update", review },
+		});
+	}
+
+	async #emitPlanReviewClosed(session: AgentSession): Promise<void> {
+		await this.#connection.sessionUpdate({
+			sessionId: session.sessionId,
+			update: { sessionUpdate: "plan_review_update", review: null },
+		});
+	}
+
+	/** `omp.planMode` / `omp.planReview` snapshot attached to session
+	 *  responses so clients can restore plan-mode UI and pending reviews. */
+	async #buildSessionMeta(session: AgentSession): Promise<Record<string, unknown>> {
+		const meta: Record<string, unknown> = {};
+		const planState = session.getPlanModeState();
+		if (planState?.enabled) {
+			const content = await this.#readAcpPlanFile(session, planState.planFilePath);
+			meta["omp.planMode"] = { version: 1, active: true, planFilePath: planState.planFilePath, content };
+		} else {
+			meta["omp.planMode"] = { version: 1, active: false };
+		}
+		const review = await this.#readPlanReviewState(session);
+		meta["omp.planReview"] = review
+			? {
+					version: 1,
+					active: true,
+					reviewId: review.reviewId,
+					planFilePath: review.planFilePath,
+					title: review.title,
+					planExists: review.planExists,
+				}
+			: { version: 1, active: false };
+		return meta;
+	}
+
+	async #exitPlanModeForApproval(session: AgentSession): Promise<void> {
+		session.setPlanProposalHandler?.(null);
+		session.setPlanModeState(undefined);
+		session.sessionManager.appendModeChange("none");
+		try {
+			await this.#connection.sessionUpdate({
+				sessionId: session.sessionId,
+				update: this.#buildCurrentModeUpdate(session),
+			});
+			await this.#pushConfigOptionUpdateForSession(session);
+		} catch (error) {
+			logger.warn("Failed to emit mode updates after plan approval", {
+				sessionId: session.sessionId,
+				error,
+			});
+		}
+	}
+
+	/** Dispatch a prompt as a user-visible turn (queued behind the active turn
+	 *  when the session is streaming). */
+	async #dispatchSessionPrompt(session: AgentSession, text: string): Promise<void> {
+		if (session.isStreaming) {
+			await session.followUp(text, undefined, { synthetic: true });
+			return;
+		}
+		try {
+			await session.prompt(text, { synthetic: true });
+		} catch (error) {
+			if (!(error instanceof AgentBusyError)) throw error;
+			await session.followUp(text, undefined, { synthetic: true });
+		}
+	}
+
+	/**
+	 * Execute a settled plan-review decision on an idle session. Approve
+	 * strategies exit plan mode, apply the chosen execution model, then
+	 * dispatch the plan-approved synthetic turn (fresh session / compacted /
+	 * preserved per strategy). Save writes the plan to the requested
+	 * workspace path and starts a fresh session. Refine dispatches the
+	 * feedback as a user prompt; cancel just closes the review. Outcomes
+	 * whose review was superseded (newer proposal, mode exit) are skipped.
+	 */
+	async #executePlanReviewOutcome(session: AgentSession, outcome: PlanReviewOutcome): Promise<void> {
+		await session.waitForIdle();
+		const state = await this.#readPlanReviewState(session);
+		if (!state || state.reviewId !== outcome.reviewId) {
+			return;
+		}
+		if (outcome.kind === "cancel") {
+			await this.#deletePlanReviewState(session);
+			await this.#emitPlanReviewClosed(session);
+			return;
+		}
+		if (outcome.kind === "refine") {
+			if (outcome.editedContent !== undefined) {
+				await this.#writePlanContent(session, outcome.planFilePath, outcome.editedContent);
+			}
+			await this.#writePlanReviewState(session, {
+				version: 1,
+				reviewId: outcome.reviewId,
+				planFilePath: outcome.planFilePath,
+				title: outcome.title,
+				planExists: true,
+				feedback: outcome.feedback,
+			});
+			await this.#emitPlanReviewClosed(session);
+			const feedback = outcome.feedback.trim() || "Refine the plan.";
+			await this.#dispatchSessionPrompt(session, feedback);
+			return;
+		}
+		if (outcome.kind === "save") {
+			// Save the plan to the requested workspace path, then start a fresh
+			// session (mirrors the TUI "Save and quit" flow).
+			const content = outcome.editedContent ?? outcome.content;
+			const destination = resolveToCwd(outcome.savePath, session.sessionManager.getCwd());
+			await Bun.write(destination, content);
+			await this.#exitPlanModeForApproval(session);
+			await this.#deletePlanReviewState(session);
+			await this.#emitPlanReviewClosed(session);
+			await session.newSession();
+			return;
+		}
+		const content = outcome.editedContent ?? outcome.content;
+		await this.#exitPlanModeForApproval(session);
+		await this.#deletePlanReviewState(session);
+		await this.#emitPlanReviewClosed(session);
+		session.setPlanReferencePath(outcome.planFilePath);
+		if (outcome.strategy === "execute") {
+			// Fresh session: snapshot the local root, start a new session, copy
+			// the session-local artifacts across, and restore the plan file so
+			// the approved plan is durable in the new session's artifact root.
+			const oldLocalRoot = this.#resolveAcpPlanFilePath(session, "local://");
+			const started = await session.newSession();
+			if (!started) {
+				logger.warn("ACP plan review fresh session was cancelled; execution not dispatched", {
+					sessionId: session.sessionId,
+				});
+				return;
+			}
+			await copyLocalArtifacts(oldLocalRoot, this.#resolveAcpPlanFilePath(session, "local://"));
+			const planAbsolutePath = this.#resolveAcpPlanFilePath(session, outcome.planFilePath);
+			await fs.mkdir(path.dirname(planAbsolutePath), { recursive: true });
+			await Bun.write(planAbsolutePath, content);
+		} else {
+			if (outcome.editedContent !== undefined) {
+				await this.#writePlanContent(session, outcome.planFilePath, content);
+			}
+			if (outcome.strategy === "compact") {
+				const guidance = prompt.render(planModeCompactInstructionsPrompt, {
+					planFilePath: outcome.planFilePath,
+				});
+				try {
+					await session.compact(undefined, { internalGuidance: guidance });
+				} catch (error) {
+					logger.warn("ACP plan review compaction failed; executing with uncompacted context", {
+						sessionId: session.sessionId,
+						error,
+					});
+				}
+			}
+		}
+		await this.#applyExecutionModelChoice(session, outcome.executionModel);
+		session.markPlanReferenceSent();
+		const execPrompt = prompt.render(planModeApprovedPrompt, {
+			planFilePath: outcome.planFilePath,
+			contextPreserved: outcome.strategy !== "execute",
+		});
+		await this.#dispatchSessionPrompt(session, execPrompt);
+		await session.waitForIdle();
+	}
+
+	/** Run a review decision submitted through the `omp.planReview/action`
+	 *  extension method inside a synthetic prompt turn, so the resulting
+	 *  agent turn streams to the client like a client-initiated prompt. */
+	async #runPlanReviewAction(record: ManagedSessionRecord, outcome: PlanReviewOutcome): Promise<void> {
+		await this.#queuePrompt(record, async () => {
+			this.#throwIfRecordClosed(record);
+			const pendingPrompt = Promise.withResolvers<PromptResponse>();
+			const promptTurn: PromptTurnState = {
+				cancelRequested: false,
+				settled: false,
+				errorTextDelivery: undefined,
+				cleanup: undefined,
+				usageBaseline: this.#cloneUsageStatistics(record.session.sessionManager.getUsageStatistics()),
+				unsubscribe: undefined,
+				resolve: pendingPrompt.resolve,
+				reject: pendingPrompt.reject,
+				promise: pendingPrompt.promise,
+			};
+			record.promptTurn = promptTurn;
+			promptTurn.unsubscribe = record.session.subscribe(event => {
+				this.#trackPromptEvent(record, event);
+			});
+			try {
+				await this.#executePlanReviewOutcome(record.session, outcome);
+				await record.session.waitForIdle();
+				await this.#waitForPromptEventHandlers(record);
+			} finally {
+				this.#finishPrompt(record, { stopReason: "end_turn" });
+			}
+			return await pendingPrompt.promise;
+		});
+	}
+
+	/** Restore plan mode for a session that loads with a pending review, and
+	 *  reinstall the proposal handler so the restored review keeps working.
+	 *  Installed as the session-switch reconciler in
+	 *  `#registerPreparedSession`. */
+	async #reconcilePlanModeFromSession(record: ManagedSessionRecord): Promise<void> {
+		const session = record.session;
+		const state = await this.#readPlanReviewState(session);
+		if (!state) return;
+		if (session.settings.get("plan.enabled") !== true) {
+			await this.#deletePlanReviewState(session);
+			return;
+		}
+		const content = await this.#readAcpPlanFile(session, state.planFilePath);
+		if (content === null) {
+			await this.#deletePlanReviewState(session);
+			return;
+		}
+		session.setPlanModeState({
+			enabled: true,
+			planFilePath: state.planFilePath,
+			workflow: "parallel",
+			reentry: true,
+		});
+		session.setPlanProposalHandler?.(title => this.#handleAcpPlanProposal(session, title));
+	}
+
+	/** Resolve the record targeted by a plan-review extension method. */
+	#getPlanReviewRecord(params: { [key: string]: unknown }): ManagedSessionRecord {
+		const sessionId = typeof params.sessionId === "string" ? params.sessionId : undefined;
+		const record = sessionId ? this.#sessions.get(sessionId) : undefined;
+		if (!record) {
+			throw new Error("Unknown ACP session");
+		}
+		return record;
+	}
+
+	/** Text-mode `/plan-review` interception: reopen the pending review or
+	 *  explain why none exists. Returns true when the text was consumed. */
+	async #tryRunPlanReviewCommand(record: ManagedSessionRecord, text: string): Promise<boolean> {
+		const parsed = parseSlashCommand(text);
+		if (!parsed || parsed.name !== "plan-review") return false;
+		if (parsed.args.trim()) {
+			await this.#emitCommandOutput(record, "Usage: /plan-review");
+			return true;
+		}
+		const state = await this.#readPlanReviewState(record.session);
+		if (!state) {
+			const planModeActive = record.session.getPlanModeState()?.enabled === true;
+			await this.#emitCommandOutput(
+				record,
+				planModeActive
+					? "No plan to review yet — write one to a local://<slug>-plan.md file and propose it first."
+					: "Plan mode is not active.",
+			);
+			return true;
+		}
+		const content = await this.#readAcpPlanFile(record.session, state.planFilePath);
+		if (content === null) {
+			await this.#deletePlanReviewState(record.session);
+			await this.#emitCommandOutput(record, "No plan to review yet — the pending plan file no longer exists.");
+			return true;
+		}
+		await this.#emitPlanReviewUpdate(record.session, {
+			reviewId: state.reviewId,
+			planFilePath: state.planFilePath,
+			title: state.title,
+			planExists: true,
+			content,
+			feedback: state.feedback,
+			options: planReviewOptions(record.session.getContextUsage()),
+			executionModels: this.#buildExecutionModelOptions(record.session),
+			context: this.#buildPlanReviewContext(record.session),
+		});
+		await this.#emitCommandOutput(record, `Plan review reopened: ${state.title}`);
+		return true;
 	}
 
 	#buildModeState(session: AgentSession): SessionModeState {

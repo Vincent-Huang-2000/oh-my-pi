@@ -310,6 +310,37 @@ export interface AvailableCommand extends Meta {
 	description: string;
 	input?: { hint: string } | null;
 }
+
+/** Plan-review option identifiers shared by the omp.planReview ACP extension. */
+export type PlanReviewOptionId = "execute" | "compact" | "keep" | "refine" | "save";
+/** A selectable plan-review option advertised to ACP clients. */
+export interface PlanReviewOption extends Meta {
+	id: PlanReviewOptionId;
+	label: string;
+	description?: string;
+	disabled?: boolean;
+}
+/** An execution-model choice (session role-model tier) for an approved plan. */
+export interface PlanReviewExecutionModel extends Meta {
+	/** Stable role key within the session's role-model cycle. */
+	id: string;
+	label: string;
+	default?: boolean;
+}
+/** Payload of the `plan_review_update` session update. */
+export interface PlanReviewSessionUpdate extends Meta {
+	reviewId: string;
+	planFilePath: string;
+	title: string;
+	planExists: boolean;
+	/** Full plan content, or null when the file is unreadable. */
+	content: string | null;
+	/** Refinement feedback accumulated while the review was open. */
+	feedback: string;
+	options: PlanReviewOption[];
+	executionModels?: PlanReviewExecutionModel[];
+	context?: { tokens: number; contextWindow: number };
+}
 /** Session plan entry. */
 export interface PlanEntry extends Meta {
 	content: string;
@@ -326,6 +357,7 @@ export type SessionUpdate =
 	| ({ sessionUpdate: "tool_call" } & ToolCall)
 	| ({ sessionUpdate: "tool_call_update" } & ToolCallUpdate)
 	| ({ sessionUpdate: "plan"; entries: PlanEntry[] } & Meta)
+	| ({ sessionUpdate: "plan_review_update"; review: PlanReviewSessionUpdate | null } & Meta)
 	| ({ sessionUpdate: "current_mode_update"; currentModeId: string } & Meta)
 	| ({ sessionUpdate: "config_option_update"; configOptions: SessionConfigOption[] } & Meta)
 	| ({ sessionUpdate: "available_commands_update"; availableCommands: AvailableCommand[] } & Meta)

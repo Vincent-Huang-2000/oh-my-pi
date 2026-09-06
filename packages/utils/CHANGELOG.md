@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the `plan_review_update` session update and the `PlanReviewOption`/`PlanReviewExecutionModel`/`PlanReviewSessionUpdate` payloads for the omp.planReview ACP plan-review extension.
+
 ## [18.1.5] - 2026-09-03
 
 ### Added
