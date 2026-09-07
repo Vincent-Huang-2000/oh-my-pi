@@ -19,7 +19,8 @@ import {
 	planReviewExecutionModels,
 	planReviewOptions,
 } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-plan-review";
-import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { ClientBridge } from "@oh-my-pi/pi-coding-agent/session/client-bridge";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { setAgentDir, getConfigRootDir } from "@oh-my-pi/pi-utils";
 import type {
@@ -54,6 +55,8 @@ class FakeAgentSession {
 	clearPlanInternalAbortPendingCalls = 0;
 	sessionSwitchReconciler: (() => Promise<void>) | undefined;
 	disposed = false;
+	clientBridge: ClientBridge | undefined;
+	#listeners = new Set<(event: AgentSessionEvent) => void>();
 
 	constructor(cwd: string) {
 		this.sessionManager = SessionManager.create(cwd);
@@ -74,7 +77,12 @@ class FakeAgentSession {
 
 	async prompt(text: string): Promise<boolean> {
 		this.promptCalls.push(text);
+		this.emit({ type: "agent_end", messages: [] } as AgentSessionEvent);
 		return true;
+	}
+
+	emit(event: AgentSessionEvent): void {
+		for (const listener of this.#listeners) listener(event);
 	}
 
 	async followUp(text: string): Promise<void> {
@@ -140,6 +148,7 @@ class FakeAgentSession {
 		await this.sessionManager.newSession();
 		this.sessionId = this.sessionManager.getSessionId();
 		this.agent.sessionId = this.sessionId;
+		this.planReferencePath = "local://PLAN.md";
 		return true;
 	}
 
@@ -155,11 +164,16 @@ class FakeAgentSession {
 		this.sessionSwitchReconciler = reconciler ?? undefined;
 	}
 
-	subscribe(): () => void {
-		return () => {};
+	subscribe(listener: (event: AgentSessionEvent) => void): () => void {
+		this.#listeners.add(listener);
+		return () => {
+			this.#listeners.delete(listener);
+		};
 	}
 
-	setClientBridge(): void {}
+	setClientBridge(bridge: ClientBridge): void {
+		this.clientBridge = bridge;
+	}
 
 	async dispose(): Promise<void> {
 		this.disposed = true;
@@ -218,6 +232,7 @@ async function createHarness(
 	options: {
 		elicitationHandler?: (req: CreateElicitationRequest) => Promise<CreateElicitationResponse>;
 		clientCapabilities?: ClientCapabilities;
+		readTextFile?: (sessionId: string) => void;
 	} = {},
 ): Promise<Harness> {
 	const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-acp-plan-review-"));
@@ -233,6 +248,10 @@ async function createHarness(
 	const abortController = new AbortController();
 	const sessions: FakeAgentSession[] = [];
 	const connection = {
+		readTextFile: async (params: { sessionId: string }) => {
+			options.readTextFile?.(params.sessionId);
+			return { content: "workspace file" };
+		},
 		sessionUpdate: async (notification: SessionNotification) => {
 			updates.push(notification);
 		},
@@ -460,6 +479,48 @@ describe("planReviewExecutionModels", () => {
 });
 
 describe("ACP plan review", () => {
+	it.each(["execute", "save"])(
+		"hands off the ACP identity after %s and accepts subsequent requests",
+		async decision => {
+			const readSessionIds: string[] = [];
+			const harness = await createHarness({
+				elicitationHandler: async () => ({ action: "accept", content: { decision, savePath: "saved-plan.md" } }),
+				clientCapabilities: { elicitation: { form: {} }, fs: { readTextFile: true } },
+				readTextFile: sessionId => {
+					readSessionIds.push(sessionId);
+				},
+			});
+			try {
+				const { created, session } = await createPlanSession(harness);
+				await session.planProposalHandler!("words-counter");
+				const replacementIndex = harness.updates.findIndex(
+					notification => notification.update._meta?.["omp.sessionReplacement"] !== undefined,
+				);
+				const replacement = harness.updates[replacementIndex]!;
+				expect(replacement.sessionId).toBe(created.sessionId);
+				expect(replacement.update._meta?.["omp.sessionReplacement"]).toEqual({
+					version: 1,
+					sessionId: session.sessionId,
+				});
+				expect(
+					harness.updates.slice(0, replacementIndex).every(update => update.sessionId === created.sessionId),
+				).toBe(true);
+				await harness.agent.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "continue" }] });
+				await harness.agent.setSessionMode({ sessionId: session.sessionId, modeId: "plan" });
+				await session.clientBridge!.readTextFile!({ path: "README.md" });
+				expect(readSessionIds).toEqual([session.sessionId]);
+				expect(
+					harness.updates.slice(replacementIndex + 1).every(update => update.sessionId === session.sessionId),
+				).toBe(true);
+				await harness.agent.closeSession({ sessionId: session.sessionId });
+				expect(session.disposed).toBe(true);
+			} finally {
+				harness.abortController.abort();
+				await Bun.sleep(0);
+			}
+		},
+	);
+
 	it("opens a full review for form-capable clients and executes the fresh-session strategy", async () => {
 		let captured: CreateElicitationRequest | undefined;
 		const harness = await createHarness({

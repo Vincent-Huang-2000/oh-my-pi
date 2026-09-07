@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed ACP fresh-session plan execution and saving to announce the replacement session ID and keep subsequent requests and tool calls routed to that session.
+
 ### Added
 
 - Added the `omp.planReview` v1 ACP plan-review extension: form-capable ACP clients now get a full five-option review (approve with a fresh session, compact, or keep context; refine with feedback; save and quit) with execution-model selection, a `plan_review_update` session update carrying the review content, `omp.planReview/reopen` and `omp.planReview/action` extension methods, and pending-review restoration when a session reloads.

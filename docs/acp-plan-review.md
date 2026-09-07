@@ -134,6 +134,17 @@ turn: the proposal turn is aborted silently (mirroring the TUI's plan-approval
 abort) and the outcome executes from the `agent_end` handler, so the synthetic
 execution turn streams to the client before the prompt response settles.
 
+### Fresh-session identity handoff
+
+After `execute` or `save` creates a new session, the agent sends a
+`session_info_update` on the **old** session ID with
+`_meta["omp.sessionReplacement"] = { "version": 1, "sessionId": "<new-id>" }`.
+Clients must adopt the new ID before processing subsequent execution updates
+or issuing requests. The owning prompt response still completes its original
+JSON-RPC request. Future prompts, modes, close requests, and tool bridge calls
+use the new ID; loading the old ID reopens the saved planning transcript.
+The handoff is followed by command and session-info updates for the new ID.
+
 ## Persistence and restoration
 
 The pending review is persisted as `.omp-plan-review.json` in the

@@ -2433,6 +2433,31 @@ export class AcpAgent implements Agent {
 		}
 	}
 
+	/** 新会话必须先完成 ACP 身份交接，才能派发执行事件或工具请求。 */
+	async #replacePlanReviewSession(session: AgentSession): Promise<boolean> {
+		const previousSessionId = session.sessionId;
+		const record = this.#getSessionRecord(previousSessionId);
+		if (!(await session.newSession())) return false;
+		this.#sessions.delete(previousSessionId);
+		this.#sessions.set(session.sessionId, record);
+		session.setClientBridge(createAcpClientBridge(this.#connection, session.sessionId, this.#clientCapabilities));
+		await this.#connection.sessionUpdate({
+			sessionId: previousSessionId,
+			update: {
+				sessionUpdate: "session_info_update",
+				_meta: { "omp.sessionReplacement": { version: 1, sessionId: session.sessionId } },
+			},
+		});
+		// 新会话可能早于首次 bootstrap 定时器建立，旧 ID 的定时器将不再生效。
+		if (!record.lifetimeUnsubscribe) {
+			record.lifetimeUnsubscribe = session.subscribe(event => {
+				void this.#handleLifetimeEvent(record, event);
+			});
+		}
+		await this.#emitBootstrapUpdates(session.sessionId, record);
+		return true;
+	}
+
 	/**
 	 * Execute a settled plan-review decision on an idle session. Approve
 	 * strategies exit plan mode, apply the chosen execution model, then
@@ -2479,7 +2504,7 @@ export class AcpAgent implements Agent {
 			await this.#exitPlanModeForApproval(session);
 			await this.#deletePlanReviewState(session);
 			await this.#emitPlanReviewClosed(session);
-			await session.newSession();
+			await this.#replacePlanReviewSession(session);
 			return;
 		}
 		const content = outcome.editedContent ?? outcome.content;
@@ -2492,7 +2517,7 @@ export class AcpAgent implements Agent {
 			// the session-local artifacts across, and restore the plan file so
 			// the approved plan is durable in the new session's artifact root.
 			const oldLocalRoot = this.#resolveAcpPlanFilePath(session, "local://");
-			const started = await session.newSession();
+			const started = await this.#replacePlanReviewSession(session);
 			if (!started) {
 				logger.warn("ACP plan review fresh session was cancelled; execution not dispatched", {
 					sessionId: session.sessionId,
@@ -2503,6 +2528,8 @@ export class AcpAgent implements Agent {
 			const planAbsolutePath = this.#resolveAcpPlanFilePath(session, outcome.planFilePath);
 			await fs.mkdir(path.dirname(planAbsolutePath), { recursive: true });
 			await Bun.write(planAbsolutePath, content);
+			// AgentSession.newSession 会重置计划引用，必须在新会话上重新设置。
+			session.setPlanReferencePath(outcome.planFilePath);
 		} else {
 			if (outcome.editedContent !== undefined) {
 				await this.#writePlanContent(session, outcome.planFilePath, content);
@@ -2713,13 +2740,17 @@ export class AcpAgent implements Agent {
 		if (this.#sessions.get(sessionId) !== record) {
 			return;
 		}
+		const availableCommands = await this.#buildAvailableCommands(record.session);
+		// 发现命令期间可能已完成会话交接，不能继续向旧 ID 发送通知。
+		if (this.#sessions.get(sessionId) !== record) return;
 		await this.#connection.sessionUpdate({
 			sessionId,
 			update: {
 				sessionUpdate: "available_commands_update",
-				availableCommands: await this.#buildAvailableCommands(record.session),
+				availableCommands,
 			},
 		});
+		if (this.#sessions.get(sessionId) !== record) return;
 		await this.#connection.sessionUpdate({
 			sessionId,
 			update: {
