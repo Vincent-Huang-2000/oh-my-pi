@@ -479,6 +479,85 @@ describe("planReviewExecutionModels", () => {
 });
 
 describe("ACP plan review", () => {
+	it.each(["refine", "keep", "cancel"])(
+		"ignores late %s after mode exit without touching a newer review",
+		async decision => {
+			const pending = Promise.withResolvers<CreateElicitationResponse>();
+			const opened = Promise.withResolvers<void>();
+			let first = true;
+			const harness = await createHarness({
+				elicitationHandler: async () => {
+					if (first) {
+						first = false;
+						opened.resolve();
+						return await pending.promise;
+					}
+					return { action: "accept", content: { decision: "refine", feedback: "new review" } };
+				},
+			});
+			try {
+				const { created, session, planUrl } = await createPlanSession(harness);
+				const proposal = session.planProposalHandler!("words-counter");
+				await opened.promise;
+				await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "default" });
+				expect(reviewUpdates(harness.updates).at(-1)?.review).toBeNull();
+				await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
+				await session.planProposalHandler!("words-counter");
+				const current = await harness.agent.extMethod("omp.planReview/reopen", { sessionId: created.sessionId });
+				const before = harness.updates.length;
+				pending.resolve({
+					action: "accept",
+					content: { decision, feedback: "stale feedback", editedContent: "stale edit" },
+				});
+				await proposal;
+				expect(session.planModeState?.enabled).toBe(true);
+				expect(harness.updates.length).toBe(before);
+				const reopened = await harness.agent.extMethod("omp.planReview/reopen", { sessionId: created.sessionId });
+				expect(reopened).toEqual(current);
+				expect(reviewUpdates(harness.updates).at(-1)?.review?.feedback).toBe("new review");
+				expect(
+					await Bun.file(path.join(harness.localRoot(created.sessionId), planUrl.slice("local://".length))).text(),
+				).toContain("File contents.");
+			} finally {
+				harness.abortController.abort();
+				await Bun.sleep(0);
+			}
+		},
+	);
+
+	it("does not resurrect a pending review from a refine response after mode exit", async () => {
+		const pending = Promise.withResolvers<CreateElicitationResponse>();
+		const opened = Promise.withResolvers<void>();
+		const harness = await createHarness({
+			elicitationHandler: async () => {
+				opened.resolve();
+				return await pending.promise;
+			},
+		});
+		try {
+			const { created, session } = await createPlanSession(harness);
+			const proposal = session.planProposalHandler!("words-counter");
+			await opened.promise;
+			await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "default" });
+			pending.resolve({ action: "accept", content: { decision: "refine", feedback: "late feedback" } });
+			await proposal;
+			expect(await harness.agent.extMethod("omp.planReview/reopen", { sessionId: created.sessionId })).toEqual({
+				ok: false,
+				error: "No pending plan review for this session.",
+			});
+			await harness.agent.closeSession({ sessionId: created.sessionId });
+			const loaded = await harness.agent.loadSession({
+				sessionId: created.sessionId,
+				cwd: harness.cwd,
+				mcpServers: [],
+			});
+			expect(loaded.modes?.currentModeId).toBe("default");
+		} finally {
+			harness.abortController.abort();
+			await Bun.sleep(0);
+		}
+	});
+
 	it.each(["execute", "save"])(
 		"hands off the ACP identity after %s and accepts subsequent requests",
 		async decision => {

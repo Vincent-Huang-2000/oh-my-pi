@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Fixed late ACP plan-review replies resurrecting closed reviews or modifying a newer review after a mode change.
 - Fixed ACP fresh-session plan execution and saving to announce the replacement session ID and keep subsequent requests and tool calls routed to that session.
 
 ### Added
