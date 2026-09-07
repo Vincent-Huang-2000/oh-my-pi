@@ -102,6 +102,7 @@ import {
 	parsePlanReviewState,
 	planReviewExecutionModels,
 	planReviewOptions,
+	validatePlanReviewDecision,
 	type AcpPlanReviewDecision,
 	type AcpPlanReviewState,
 	type PlanReviewOutcome,
@@ -1257,7 +1258,10 @@ export class AcpAgent implements Agent {
 			}
 			case "omp.planReview/action": {
 				const record = this.#getPlanReviewRecord(params);
-				const decision = parsePlanReviewAction(params);
+				const decision = validatePlanReviewDecision(
+					parsePlanReviewAction(params),
+					record.session.getContextUsage(),
+				);
 				if (!decision) {
 					return { ok: false, error: "Invalid plan review action." };
 				}
@@ -1282,8 +1286,8 @@ export class AcpAgent implements Agent {
 					title: state.title,
 					content,
 				};
-				await this.#runPlanReviewAction(record, outcome);
-				return { ok: true };
+				const error = await this.#runPlanReviewAction(record, outcome);
+				return error ? { ok: false, error } : { ok: true };
 			}
 			default:
 				throw new Error(`Unknown ACP ext method: ${method}`);
@@ -1573,7 +1577,11 @@ export class AcpAgent implements Agent {
 			record.pendingPlanOutcome = undefined;
 			if (pendingOutcome) {
 				try {
-					await this.#executePlanReviewOutcome(record.session, pendingOutcome);
+					const error = await this.#executePlanReviewOutcome(record.session, pendingOutcome);
+					if (error) {
+						await this.#emitPlanReviewClosed(record.session);
+						await this.#emitCommandOutput(record, error);
+					}
 				} catch (error) {
 					logger.warn("ACP plan review outcome failed", { sessionId: record.session.sessionId, error });
 				}
@@ -2076,7 +2084,7 @@ export class AcpAgent implements Agent {
 				context: this.#buildPlanReviewContext(session),
 			});
 		}
-		const decision = await this.#requestAcpPlanReviewChoice(
+		const requestedDecision = await this.#requestAcpPlanReviewChoice(
 			session.sessionId,
 			resolvedTitle,
 			planContent,
@@ -2094,6 +2102,7 @@ export class AcpAgent implements Agent {
 						details,
 					};
 				}
+				const decision = validatePlanReviewDecision(requestedDecision, session.getContextUsage());
 				const normalizedTitle = normalizePlanTitle(resolvedTitle).title;
 				if (!decision || decision.kind === "cancel") {
 					// Dismissal keeps plan mode active for another planning turn —
@@ -2217,7 +2226,11 @@ export class AcpAgent implements Agent {
 		);
 		if (!("kind" in resolution)) return resolution;
 		const outcome = resolution;
-		await this.#executePlanReviewOutcome(session, outcome);
+		const error = await this.#executePlanReviewOutcome(session, outcome);
+		if (error) {
+			await this.#emitPlanReviewClosed(session);
+			return { content: [{ type: "text", text: error }], details };
+		}
 		return {
 			content: [
 				{
@@ -2506,12 +2519,15 @@ export class AcpAgent implements Agent {
 	 * feedback as a user prompt; cancel just closes the review. Outcomes
 	 * whose review was superseded (newer proposal, mode exit) are skipped.
 	 */
-	async #executePlanReviewOutcome(session: AgentSession, outcome: PlanReviewOutcome): Promise<void> {
+	async #executePlanReviewOutcome(session: AgentSession, outcome: PlanReviewOutcome): Promise<string | undefined> {
 		await session.waitForIdle();
 		const state = await this.#readPlanReviewState(session);
 		if (!state || state.reviewId !== outcome.reviewId) {
 			return;
 		}
+		// 排队或等待空闲期间用量可能变化，必须在任何编辑、清理或执行副作用前再次检查。
+		const checked = validatePlanReviewDecision(outcome, session.getContextUsage());
+		if (checked?.kind === "invalid") return checked.reason;
 		if (outcome.kind === "cancel") {
 			await this.#deletePlanReviewState(session);
 			await this.#emitPlanReviewClosed(session);
@@ -2600,7 +2616,8 @@ export class AcpAgent implements Agent {
 	/** Run a review decision submitted through the `omp.planReview/action`
 	 *  extension method inside a synthetic prompt turn, so the resulting
 	 *  agent turn streams to the client like a client-initiated prompt. */
-	async #runPlanReviewAction(record: ManagedSessionRecord, outcome: PlanReviewOutcome): Promise<void> {
+	async #runPlanReviewAction(record: ManagedSessionRecord, outcome: PlanReviewOutcome): Promise<string | undefined> {
+		let actionError: string | undefined;
 		await this.#queuePrompt(record, async () => {
 			this.#throwIfRecordClosed(record);
 			const pendingPrompt = Promise.withResolvers<PromptResponse>();
@@ -2620,7 +2637,7 @@ export class AcpAgent implements Agent {
 				this.#trackPromptEvent(record, event);
 			});
 			try {
-				await this.#executePlanReviewOutcome(record.session, outcome);
+				actionError = await this.#executePlanReviewOutcome(record.session, outcome);
 				await record.session.waitForIdle();
 				await this.#waitForPromptEventHandlers(record);
 			} finally {
@@ -2628,6 +2645,7 @@ export class AcpAgent implements Agent {
 			}
 			return await pendingPrompt.promise;
 		});
+		return actionError;
 	}
 
 	/** Restore journaled plan mode independently of a pending review, and

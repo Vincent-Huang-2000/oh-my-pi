@@ -83,7 +83,11 @@ update.
 ```
 
 `option.id` values are stable contract strings. `keep` is disabled above 95%
-context usage. `executionModels[].id` is the session's role-model key
+context usage. This limit is also enforced when a form response arrives and
+immediately before a queued decision executes. A rejected choice preserves the
+plan and pending review; action requests return `{ ok: false, error }` so the
+client can choose another strategy. Non-form auto-approval cannot bypass the
+limit either. `executionModels[].id` is the session's role-model key
 (`default`, `slow`, `smol`, `plan`, custom roles).
 
 ## Decision submission

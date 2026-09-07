@@ -127,6 +127,23 @@ export type AcpPlanReviewDecision =
 	| { kind: "cancel" }
 	| { kind: "invalid"; reason: string };
 
+/** 使用执行时的用量验证选择；界面禁用状态不能代替服务端检查。 */
+export function validatePlanReviewDecision(
+	decision: AcpPlanReviewDecision | undefined,
+	contextUsage: ContextUsage | undefined,
+): AcpPlanReviewDecision | undefined {
+	if (
+		decision?.kind === "approve" &&
+		planReviewOptions(contextUsage).some(option => option.id === decision.strategy && option.disabled)
+	) {
+		return {
+			kind: "invalid",
+			reason: "Keeping context is unavailable above 95% usage. Choose another review option.",
+		};
+	}
+	return decision;
+}
+
 /** A decision joined with the review identity and plan content it applies to. */
 export type PlanReviewOutcome = Exclude<AcpPlanReviewDecision, { kind: "invalid" }> & {
 	reviewId: string;

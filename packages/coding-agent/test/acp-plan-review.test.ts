@@ -10,6 +10,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { ContextUsage } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import { AcpAgent } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-agent";
 import {
@@ -56,6 +57,7 @@ class FakeAgentSession {
 	sessionSwitchReconciler: (() => Promise<void>) | undefined;
 	disposed = false;
 	clientBridge: ClientBridge | undefined;
+	contextUsage: ContextUsage | undefined;
 	#listeners = new Set<(event: AgentSessionEvent) => void>();
 
 	constructor(cwd: string) {
@@ -107,8 +109,8 @@ class FakeAgentSession {
 		return false;
 	}
 
-	getContextUsage(): undefined {
-		return undefined;
+	getContextUsage(): ContextUsage | undefined {
+		return this.contextUsage;
 	}
 
 	getPlanModeState(): FakeAgentSession["planModeState"] {
@@ -479,6 +481,188 @@ describe("planReviewExecutionModels", () => {
 });
 
 describe("ACP plan review", () => {
+	it.each(["execute", "compact", "keep", "save"])(
+		"completes deferred %s inside the owning prompt at the allowed context boundary",
+		async decision => {
+			const harness = await createHarness({
+				elicitationHandler: async () => ({
+					action: "accept",
+					content: { decision, editedContent: "approved edit", savePath: "approved-plan.md" },
+				}),
+			});
+			try {
+				const { created, session } = await createPlanSession(harness);
+				session.contextUsage = { tokens: 190000, contextWindow: 200000, percent: 95 };
+				const originalPrompt = session.prompt.bind(session);
+				let submitted = false;
+				session.prompt = async text => {
+					if (submitted) return originalPrompt(text);
+					submitted = true;
+					session.isStreaming = true;
+					await session.planProposalHandler!("words-counter");
+					session.emit({ type: "agent_end", messages: [] } as AgentSessionEvent);
+					return true;
+				};
+				const result = await harness.agent.prompt({
+					sessionId: created.sessionId,
+					prompt: [{ type: "text", text: "propose the plan" }],
+				});
+				expect(result.stopReason).toBe("end_turn");
+				expect(session.markPlanInternalAbortPendingCalls).toBe(1);
+				expect(session.planModeState).toBeUndefined();
+				expect(session.promptCalls.length).toBe(decision === "save" ? 0 : 1);
+				const planPath =
+					decision === "save"
+						? path.join(harness.cwd, "approved-plan.md")
+						: path.join(harness.localRoot(session.sessionId), "words-counter-plan.md");
+				expect(await Bun.file(planPath).text()).toBe("approved edit");
+				expect(session.compactCalls.length).toBe(decision === "compact" ? 1 : 0);
+				expect(session.sessionId === created.sessionId).toBe(decision === "compact" || decision === "keep");
+			} finally {
+				harness.abortController.abort();
+				await Bun.sleep(0);
+			}
+		},
+	);
+
+	it("rejects deferred keep at agent_end and settles the prompt without dispatching execution", async () => {
+		const harness = await createHarness({
+			elicitationHandler: async () => ({
+				action: "accept",
+				content: { decision: "keep", editedContent: "unapproved edit" },
+			}),
+		});
+		try {
+			const { created, session } = await createPlanSession(harness);
+			session.contextUsage = { tokens: 190000, contextWindow: 200000, percent: 95 };
+			const originalPrompt = session.prompt.bind(session);
+			let submitted = false;
+			session.prompt = async text => {
+				if (submitted) return originalPrompt(text);
+				submitted = true;
+				session.isStreaming = true;
+				await session.planProposalHandler!("words-counter");
+				session.contextUsage = { tokens: 196000, contextWindow: 200000, percent: 98 };
+				session.emit({ type: "agent_end", messages: [] } as AgentSessionEvent);
+				return true;
+			};
+			const result = await harness.agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "propose the plan" }],
+			});
+			expect(result.stopReason).toBe("end_turn");
+			expect(session.markPlanInternalAbortPendingCalls).toBe(1);
+			expect(session.promptCalls).toEqual([]);
+			expect(session.planModeState?.enabled).toBe(true);
+			expect(
+				harness.updates.some(
+					notification =>
+						notification.update.sessionUpdate === "agent_message_chunk" &&
+						notification.update.content.type === "text" &&
+						notification.update.content.text.includes("95%"),
+				),
+			).toBe(true);
+			expect((await harness.agent.extMethod("omp.planReview/reopen", { sessionId: created.sessionId })).ok).toBe(
+				true,
+			);
+			expect(reviewUpdates(harness.updates).at(-1)?.review?.content).toContain("File contents.");
+		} finally {
+			harness.abortController.abort();
+			await Bun.sleep(0);
+		}
+	});
+
+	it("rejects a keep response when usage grew while the review was open, preserving edits and review state", async () => {
+		let session: FakeAgentSession;
+		let offeredKeep = false;
+		const harness = await createHarness({
+			elicitationHandler: async request => {
+				const choices = request.mode === "form" ? request.requestedSchema?.properties.decision?.oneOf : undefined;
+				offeredKeep =
+					Array.isArray(choices) &&
+					choices.some(
+						option =>
+							typeof option === "object" && option !== null && "const" in option && option.const === "keep",
+					);
+				session.contextUsage = { tokens: 196000, contextWindow: 200000, percent: 98 };
+				return { action: "accept", content: { decision: "keep", editedContent: "unapproved edit" } };
+			},
+		});
+		try {
+			const created = await createPlanSession(harness);
+			session = created.session;
+			session.contextUsage = { tokens: 190000, contextWindow: 200000, percent: 95 };
+			await session.planProposalHandler!("words-counter");
+			expect(offeredKeep).toBe(true);
+			expect(session.planModeState?.enabled).toBe(true);
+			expect(session.promptCalls).toEqual([]);
+			expect(
+				(await harness.agent.extMethod("omp.planReview/reopen", { sessionId: created.created.sessionId })).ok,
+			).toBe(true);
+			expect(reviewUpdates(harness.updates).at(-1)?.review?.content).toContain("File contents.");
+		} finally {
+			harness.abortController.abort();
+			await Bun.sleep(0);
+		}
+	});
+
+	it("rejects disabled keep actions but accepts the 95 percent boundary without consuming a rejected review", async () => {
+		const harness = await createHarness({
+			elicitationHandler: async () => ({ action: "accept", content: { decision: "refine" } }),
+		});
+		try {
+			const { created, session } = await createPlanSession(harness);
+			await session.planProposalHandler!("words-counter");
+			const { reviewId } = await harness.agent.extMethod("omp.planReview/reopen", { sessionId: created.sessionId });
+			const params = { sessionId: created.sessionId, reviewId, decision: "keep" };
+			session.contextUsage = { tokens: 196000, contextWindow: 200000, percent: 98 };
+			const rejected = await harness.agent.extMethod("omp.planReview/action", params);
+			expect(rejected.ok).toBe(false);
+			expect(rejected.error).toContain("95%");
+			expect(session.planModeState?.enabled).toBe(true);
+			expect(session.promptCalls).toEqual([]);
+			session.contextUsage = { tokens: 190000, contextWindow: 200000, percent: 95 };
+			expect(await harness.agent.extMethod("omp.planReview/action", params)).toEqual({ ok: true });
+			expect(session.planModeState).toBeUndefined();
+			expect(session.promptCalls.length).toBe(1);
+		} finally {
+			harness.abortController.abort();
+			await Bun.sleep(0);
+		}
+	});
+
+	it("rechecks keep after waiting for idle before applying any decision side effects", async () => {
+		const harness = await createHarness({
+			elicitationHandler: async () => ({ action: "accept", content: { decision: "refine" } }),
+		});
+		try {
+			const { created, session } = await createPlanSession(harness);
+			await session.planProposalHandler!("words-counter");
+			const { reviewId } = await harness.agent.extMethod("omp.planReview/reopen", { sessionId: created.sessionId });
+			session.contextUsage = { tokens: 190000, contextWindow: 200000, percent: 95 };
+			session.waitForIdle = async () => {
+				session.contextUsage = { tokens: 196000, contextWindow: 200000, percent: 98 };
+			};
+			const rejected = await harness.agent.extMethod("omp.planReview/action", {
+				sessionId: created.sessionId,
+				reviewId,
+				decision: "keep",
+				editedContent: "unapproved edit",
+			});
+			expect(rejected.ok).toBe(false);
+			expect(rejected.error).toContain("95%");
+			expect(session.planModeState?.enabled).toBe(true);
+			expect(session.promptCalls).toEqual([]);
+			expect(
+				(await harness.agent.extMethod("omp.planReview/reopen", { sessionId: created.sessionId })).reviewId,
+			).toBe(reviewId);
+			expect(reviewUpdates(harness.updates).at(-1)?.review?.content).toContain("File contents.");
+		} finally {
+			harness.abortController.abort();
+			await Bun.sleep(0);
+		}
+	});
+
 	it("does not reactivate an old plan after plan support is disabled and re-enabled", async () => {
 		const harness = await createHarness();
 		try {
