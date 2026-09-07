@@ -161,10 +161,13 @@ session-local root next to the plan file:
 }
 ```
 
-Loading a session whose review is pending (plan file still present, plan mode
-enabled in settings) restores plan mode, reinstalls the proposal handler, and
-reports the snapshot above. Explicit mode exit, approval, save, and cancel all
-delete the state so a reload cannot resurrect a consumed review. `/plan-review`
+Loading or resuming a session restores plan mode from the mode-change journal,
+even before the first proposal or when the plan file has not been created yet.
+The proposal handler is reinstalled. Pending reviews additionally require an
+existing plan file. Explicit mode exit, approval, save, and cancel all delete
+the review state; cancel preserves journaled plan mode without reopening the
+consumed review. Disabled plan support clears journaled plan mode as well.
+`/plan-review`
 in text mode reopens the pending review; the TUI-only command is not
 advertised to ACP clients.
 

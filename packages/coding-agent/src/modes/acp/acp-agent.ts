@@ -2046,6 +2046,7 @@ export class AcpAgent implements Agent {
 			// stale state path.
 			if (state.planFilePath !== planFilePath) {
 				session.setPlanModeState({ ...state, planFilePath });
+				session.sessionManager.appendModeChange(ACP_PLAN_MODE_ID, { planFilePath });
 			}
 			await this.#writePlanReviewState(session, {
 				version: 1,
@@ -2629,26 +2630,35 @@ export class AcpAgent implements Agent {
 		});
 	}
 
-	/** Restore plan mode for a session that loads with a pending review, and
-	 *  reinstall the proposal handler so the restored review keeps working.
+	/** Restore journaled plan mode independently of a pending review, and
+	 *  reinstall the proposal handler so planning can continue before submission.
 	 *  Installed as the session-switch reconciler in
 	 *  `#registerPreparedSession`. */
 	async #reconcilePlanModeFromSession(record: ManagedSessionRecord): Promise<void> {
 		const session = record.session;
-		const state = await this.#readPlanReviewState(session);
-		if (!state) return;
-		if (session.settings.get("plan.enabled") !== true) {
+		const context = session.sessionManager.buildSessionContext();
+		session.setPlanProposalHandler?.(null);
+		session.setPlanModeState(undefined);
+		if (session.settings.get("plan.enabled") !== true || context.mode !== ACP_PLAN_MODE_ID) {
+			if (session.settings.get("plan.enabled") !== true && context.mode === ACP_PLAN_MODE_ID) {
+				session.sessionManager.appendModeChange("none");
+			}
 			await this.#deletePlanReviewState(session);
 			return;
 		}
-		const content = await this.#readAcpPlanFile(session, state.planFilePath);
-		if (content === null) {
+		let state = await this.#readPlanReviewState(session);
+		if (state && (await this.#readAcpPlanFile(session, state.planFilePath)) === null) {
 			await this.#deletePlanReviewState(session);
-			return;
+			state = null;
 		}
+		// 计划文件可以尚未创建；不能因此把仍受只读约束的规划会话恢复为 default。
+		const journalPath = context.modeData?.planFilePath;
+		const planFilePath =
+			state?.planFilePath ??
+			(typeof journalPath === "string" && journalPath.length > 0 ? journalPath : DEFAULT_PLAN_FILE_URL);
 		session.setPlanModeState({
 			enabled: true,
-			planFilePath: state.planFilePath,
+			planFilePath,
 			workflow: "parallel",
 			reentry: true,
 		});

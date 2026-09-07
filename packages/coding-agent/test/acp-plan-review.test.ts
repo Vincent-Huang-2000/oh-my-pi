@@ -479,6 +479,89 @@ describe("planReviewExecutionModels", () => {
 });
 
 describe("ACP plan review", () => {
+	it("does not reactivate an old plan after plan support is disabled and re-enabled", async () => {
+		const harness = await createHarness();
+		try {
+			const { created } = await createPlanSession(harness);
+			const params = { sessionId: created.sessionId, cwd: harness.cwd, mcpServers: [] };
+			await harness.agent.closeSession({ sessionId: created.sessionId });
+			Settings.instance.set("plan.enabled", false);
+			expect((await harness.agent.loadSession(params)).modes?.currentModeId).toBe("default");
+			await harness.agent.closeSession({ sessionId: created.sessionId });
+			Settings.instance.set("plan.enabled", true);
+			expect((await harness.agent.loadSession(params)).modes?.currentModeId).toBe("default");
+		} finally {
+			harness.abortController.abort();
+			await Bun.sleep(0);
+		}
+	});
+	it.each(["load", "resume"])("restores planning before the first proposal through %s", async method => {
+		const harness = await createHarness();
+		try {
+			const { created } = await createPlanSession(harness);
+			await harness.agent.closeSession({ sessionId: created.sessionId });
+			const params = { sessionId: created.sessionId, cwd: harness.cwd, mcpServers: [] };
+			const restored =
+				method === "load" ? await harness.agent.loadSession(params) : await harness.agent.resumeSession(params);
+			expect(restored.modes?.currentModeId).toBe("plan");
+			expect(restored._meta?.["omp.planMode"]).toEqual({
+				version: 1,
+				active: true,
+				planFilePath: "local://PLAN.md",
+				content: null,
+			});
+			expect(restored._meta?.["omp.planReview"]).toEqual({ version: 1, active: false });
+			const loaded = harness.sessions.at(-1)!;
+			await loaded.planProposalHandler!("words-counter");
+			expect(loaded.planReferencePath).toBe("local://words-counter-plan.md");
+		} finally {
+			harness.abortController.abort();
+			await Bun.sleep(0);
+		}
+	});
+
+	it("restores the reviewed path after dismissal without resurrecting the dismissed review", async () => {
+		const harness = await createHarness({ elicitationHandler: async () => ({ action: "cancel" }) });
+		try {
+			const { created, session, planUrl } = await createPlanSession(harness);
+			await session.planProposalHandler!("words-counter");
+			await harness.agent.closeSession({ sessionId: created.sessionId });
+			const restored = await harness.agent.loadSession({
+				sessionId: created.sessionId,
+				cwd: harness.cwd,
+				mcpServers: [],
+			});
+			expect(restored.modes?.currentModeId).toBe("plan");
+			expect(harness.sessions.at(-1)!.planModeState?.planFilePath).toBe(planUrl);
+			expect(restored._meta?.["omp.planReview"]).toEqual({ version: 1, active: false });
+		} finally {
+			harness.abortController.abort();
+			await Bun.sleep(0);
+		}
+	});
+
+	it("keeps missing-plan sessions in plan mode but does not restore missing or explicitly consumed reviews", async () => {
+		const harness = await createHarness({
+			elicitationHandler: async () => ({ action: "accept", content: { decision: "refine" } }),
+		});
+		try {
+			const { created, session } = await createPlanSession(harness);
+			await session.planProposalHandler!("words-counter");
+			await fs.promises.unlink(path.join(harness.localRoot(created.sessionId), "words-counter-plan.md"));
+			await harness.agent.closeSession({ sessionId: created.sessionId });
+			const params = { sessionId: created.sessionId, cwd: harness.cwd, mcpServers: [] };
+			const restored = await harness.agent.loadSession(params);
+			expect(restored.modes?.currentModeId).toBe("plan");
+			expect(restored._meta?.["omp.planReview"]).toEqual({ version: 1, active: false });
+			await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "default" });
+			await harness.agent.closeSession({ sessionId: created.sessionId });
+			expect((await harness.agent.loadSession(params)).modes?.currentModeId).toBe("default");
+		} finally {
+			harness.abortController.abort();
+			await Bun.sleep(0);
+		}
+	});
+
 	it.each(["refine", "keep", "cancel"])(
 		"ignores late %s after mode exit without touching a newer review",
 		async decision => {
