@@ -46,6 +46,12 @@ export interface LoadContext {
 	extensionRoots?: EffectiveExtensionRoots;
 	/** Provider IDs explicitly requested by caller in LoadOptions */
 	explicitProviders?: Set<string>;
+	/**
+	 * Scan foreign `~/` sources even when not opted in. Set for
+	 * `includeDisabled` (dashboard) loads so opted-out items are listed
+	 * and can be switched on.
+	 */
+	includeOptOutUserSources?: boolean;
 }
 
 /**
@@ -98,7 +104,7 @@ export interface LoadOptions<T = unknown> {
 	cwd?: string;
 	/** Include items even if they fail validation. Default: false */
 	includeInvalid?: boolean;
-	/** Include items disabled via settings. Default: false */
+	/** Include disabled items without letting them shadow enabled items. Default: false */
 	includeDisabled?: boolean;
 	/** Explicit disabled extension IDs to apply instead of settings. */
 	disabledExtensions?: string[];
@@ -139,6 +145,14 @@ export interface SourceMeta {
 	path: string;
 	/** Whether this came from user-level, project-level, or native config */
 	level: "user" | "project" | "native";
+	/**
+	 * Registry or CLI source that supplied a plugin root, when the provider
+	 * tracks it (currently `claude-plugins`: `"claude"` for `~/.claude/plugins`,
+	 * `"omp"` for omp's own registry, `"plugin-dir"` for `--plugin-dir`). Lets
+	 * user-scope gating distinguish omp's own installs from the foreign Claude
+	 * tree — see `isSourceEnabled` in `extensibility/skills.ts` (#10743).
+	 */
+	origin?: string;
 }
 
 /**

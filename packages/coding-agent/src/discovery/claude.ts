@@ -31,15 +31,39 @@ import {
 	loadFilesFromDir,
 	scanSkillsFromDir,
 } from "./helpers";
+import type { Setting } from "../config/registry";
+
+import {
+	cfgCommandsEnableClaudeProject,
+	cfgCommandsEnableClaudeUser,
+	cfgSkillsEnableClaudeUser,
+} from "../extensibility/settings";
 
 const PROVIDER_ID = "claude";
 const DISPLAY_NAME = "Claude Code";
 const PRIORITY = 80;
 const CONFIG_DIR = ".claude";
 
-/** Get the active user-level Claude Code directory, or null if not enabled. */
-function getUserClaude(ctx: LoadContext): string | null {
-	if (!isUserSourceEnabled("claude", ctx)) return null;
+/**
+ * Read a legacy per-capability `~/.claude` toggle. Defaults to off (opt-in);
+ * also off when settings are not initialized (discovery unit tests).
+ */
+function readClaudeUserToggle(toggle: Setting<boolean>): boolean {
+	try {
+		return toggle.get(settings) === true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Get the active user-level Claude Code directory, or null when `~/.claude`
+ * is not opted in. `capabilityToggle` is a legacy per-capability opt-in
+ * (`skills.enableClaudeUser`, `commands.enableClaudeUser`) that admits just
+ * that capability's directory.
+ */
+function getUserClaude(ctx: LoadContext, capabilityToggle = false): string | null {
+	if (!capabilityToggle && !isUserSourceEnabled("claude", ctx)) return null;
 	const { configDir } = resolveClaudePaths(ctx.home);
 	return configDir;
 }
@@ -171,7 +195,7 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 // =============================================================================
 
 async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
-	const userBase = getUserClaude(ctx);
+	const userBase = getUserClaude(ctx, readClaudeUserToggle(cfgSkillsEnableClaudeUser));
 	const userSkillsDir = userBase ? path.join(userBase, "skills") : null;
 
 	// Walk up from cwd finding .claude/skills/ in ancestors. Skip $HOME:
@@ -265,18 +289,14 @@ async function loadExtensionModules(ctx: LoadContext): Promise<LoadResult<Extens
 // =============================================================================
 
 /**
- * Read the Claude command-loading toggles from settings.
- * Falls back to true (current behavior) when settings are not initialized,
- * e.g. inside discovery unit tests that run without Settings.init().
+ * Read the project command-loading toggle. Falls back to true when settings
+ * are not initialized, e.g. inside discovery unit tests without Settings.init().
  */
-function readClaudeCommandToggles(): { enableUser: boolean; enableProject: boolean } {
+function readClaudeProjectCommandsToggle(): boolean {
 	try {
-		return {
-			enableUser: settings.get("commands.enableClaudeUser") ?? false,
-			enableProject: settings.get("commands.enableClaudeProject") ?? true,
-		};
+		return cfgCommandsEnableClaudeProject.get(settings);
 	} catch {
-		return { enableUser: false, enableProject: true };
+		return true;
 	}
 }
 
@@ -306,29 +326,26 @@ function addClaudeCommandNamespaceAliases(commands: SlashCommand[], commandsDir:
 async function loadSlashCommands(ctx: LoadContext): Promise<LoadResult<SlashCommand>> {
 	const items: SlashCommand[] = [];
 	const warnings: string[] = [];
-	const { enableUser, enableProject } = readClaudeCommandToggles();
+	const enableProject = readClaudeProjectCommandsToggle();
 
-	const userBase = getUserClaude(ctx);
-	if (enableUser || userBase) {
-		const effectiveUserBase = userBase ?? (enableUser ? resolveClaudePaths(ctx.home).configDir : null);
-		if (effectiveUserBase) {
-			const userCommandsDir = path.join(effectiveUserBase, "commands");
+	const userBase = getUserClaude(ctx, readClaudeUserToggle(cfgCommandsEnableClaudeUser));
+	if (userBase) {
+		const userCommandsDir = path.join(userBase, "commands");
 
-			const userResult = await loadFilesFromDir<SlashCommand>(ctx, userCommandsDir, PROVIDER_ID, "user", {
-				extensions: ["md"],
-				recursive: true,
-				transform: (name, content, filePath, source) => ({
-					name: name.replace(/\.md$/, ""),
-					path: filePath,
-					content,
-					level: "user",
-					_source: source,
-				}),
-			});
+		const userResult = await loadFilesFromDir<SlashCommand>(ctx, userCommandsDir, PROVIDER_ID, "user", {
+			extensions: ["md"],
+			recursive: true,
+			transform: (name, content, filePath, source) => ({
+				name: name.replace(/\.md$/, ""),
+				path: filePath,
+				content,
+				level: "user",
+				_source: source,
+			}),
+		});
 
-			items.push(...addClaudeCommandNamespaceAliases(userResult.items, userCommandsDir));
-			if (userResult.warnings) warnings.push(...userResult.warnings);
-		}
+		items.push(...addClaudeCommandNamespaceAliases(userResult.items, userCommandsDir));
+		if (userResult.warnings) warnings.push(...userResult.warnings);
 	}
 
 	if (enableProject) {
@@ -465,18 +482,41 @@ async function loadSystemPrompts(ctx: LoadContext): Promise<LoadResult<SystemPro
 	const items: SystemPrompt[] = [];
 	const warnings: string[] = [];
 
+	const projectBase = getProjectClaude(ctx);
+	for (const [file, kind] of [
+		["SYSTEM_TEMPLATE.md", "template"],
+		["SYSTEM.md", "text"],
+	] as const) {
+		const projectPath = path.join(projectBase, file);
+		const content = await readFile(projectPath);
+		if (content) {
+			items.push({
+				path: projectPath,
+				content,
+				kind,
+				level: "project",
+				_source: createSourceMeta(PROVIDER_ID, projectPath, "project"),
+			});
+		}
+	}
+
 	const userBase = getUserClaude(ctx);
 	if (userBase) {
-		const userSystemMd = path.join(userBase, "SYSTEM.md");
-
-		const content = await readFile(userSystemMd);
-		if (content !== null) {
-			items.push({
-				path: userSystemMd,
-				content,
-				level: "user",
-				_source: createSourceMeta(PROVIDER_ID, userSystemMd, "user"),
-			});
+		for (const [file, kind] of [
+			["SYSTEM_TEMPLATE.md", "template"],
+			["SYSTEM.md", "text"],
+		] as const) {
+			const userPath = path.join(userBase, file);
+			const content = await readFile(userPath);
+			if (content !== null) {
+				items.push({
+					path: userPath,
+					content,
+					kind,
+					level: "user",
+					_source: createSourceMeta(PROVIDER_ID, userPath, "user"),
+				});
+			}
 		}
 	}
 

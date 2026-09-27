@@ -21,9 +21,12 @@ import type { Prompt } from "../capability/prompt";
 import { promptCapability } from "../capability/prompt";
 import type { Settings } from "../capability/settings";
 import { settingsCapability } from "../capability/settings";
+import { settings as activeSettings } from "../config/settings";
 import type { Skill } from "../capability/skill";
 import { skillCapability } from "../capability/skill";
-import { type SlashCommand, slashCommandCapability, slashCommandFrontmatterDisplay } from "../capability/slash-command";
+import { type SlashCommand, slashCommandCapability } from "../capability/slash-command";
+import { type SystemPrompt, systemPromptCapability } from "../capability/system-prompt";
+import { slashCommandFrontmatterDisplay } from "@oh-my-pi/pi-tui/overlays/extensions/inspector-model";
 import type { CustomTool } from "../capability/tool";
 import { toolCapability } from "../capability/tool";
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
@@ -38,6 +41,8 @@ import {
 } from "./helpers";
 import { resolvePluginStdioPaths } from "./substitute-plugin-root";
 
+import { cfgSkillsEnableCodexUser } from "../extensibility/settings";
+
 const PROVIDER_ID = "codex";
 const DISPLAY_NAME = "OpenAI Codex";
 const PRIORITY = 70;
@@ -46,9 +51,23 @@ function getProjectCodexDir(ctx: LoadContext): string {
 	return path.join(ctx.cwd, ".codex");
 }
 
-function getUserCodexDir(ctx: LoadContext): string | null {
-	if (!isUserSourceEnabled("codex", ctx)) return null;
+/**
+ * `~/.codex`, or null when not opted in. `capabilityToggle` is a legacy
+ * per-capability opt-in (`skills.enableCodexUser`) admitting only that
+ * capability's directory.
+ */
+function getUserCodexDir(ctx: LoadContext, capabilityToggle = false): string | null {
+	if (!capabilityToggle && !isUserSourceEnabled("codex", ctx)) return null;
 	return path.join(ctx.home, SOURCE_PATHS.codex.userBase);
+}
+
+/** Legacy `skills.enableCodexUser` toggle; off by default and without initialized settings. */
+function readCodexUserSkillsToggle(): boolean {
+	try {
+		return cfgSkillsEnableCodexUser.get(activeSettings) === true;
+	} catch {
+		return false;
+	}
 }
 
 // =============================================================================
@@ -243,7 +262,7 @@ function extractMCPServersFromToml(
 // =============================================================================
 
 async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
-	const userDir = getUserCodexDir(ctx);
+	const userDir = getUserCodexDir(ctx, readCodexUserSkillsToggle());
 	const userSkillsDir = userDir ? path.join(userDir, "skills") : null;
 	const codexDir = getProjectCodexDir(ctx);
 	const projectSkillsDir = path.join(codexDir, "skills");
@@ -576,4 +595,36 @@ registerProvider<Settings>(settingsCapability.id, {
 	description: "Load settings from config.toml",
 	priority: PRIORITY,
 	load: loadSettings,
+});
+
+// System Prompt (SYSTEM.md, SYSTEM_TEMPLATE.md)
+async function loadSystemPrompt(ctx: LoadContext): Promise<LoadResult<SystemPrompt>> {
+	const items: SystemPrompt[] = [];
+
+	const load = async (filePath: string | null, level: "user" | "project", kind: "text" | "template") => {
+		if (!filePath) return;
+		const content = await readFile(filePath);
+		if (content) {
+			items.push({ path: filePath, content, kind, level, _source: createSourceMeta(PROVIDER_ID, filePath, level) });
+		}
+	};
+
+	// Project entries first: dedupe is first-wins, so a project file claims its
+	// key before a same-scope user file can survive.
+	const projectDir = getProjectCodexDir(ctx);
+	const userDir = getUserCodexDir(ctx);
+	await load(path.join(projectDir, "SYSTEM_TEMPLATE.md"), "project", "template");
+	await load(path.join(projectDir, "SYSTEM.md"), "project", "text");
+	await load(userDir ? path.join(userDir, "SYSTEM_TEMPLATE.md") : null, "user", "template");
+	await load(userDir ? path.join(userDir, "SYSTEM.md") : null, "user", "text");
+
+	return { items, warnings: [] };
+}
+
+registerProvider<SystemPrompt>(systemPromptCapability.id, {
+	id: PROVIDER_ID,
+	displayName: DISPLAY_NAME,
+	description: "Load SYSTEM.md and SYSTEM_TEMPLATE.md from .codex (project cwd + user home)",
+	priority: PRIORITY,
+	load: loadSystemPrompt,
 });

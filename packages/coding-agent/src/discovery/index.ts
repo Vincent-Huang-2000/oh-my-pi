@@ -36,6 +36,7 @@ import "./opencode";
 import "./github";
 import "./mcp-json";
 import "./omp-plugins";
+import "./skillshare";
 import "./ssh";
 import "./vscode";
 import "./windsurf";
@@ -45,7 +46,9 @@ export {
 	cacheStats,
 	// Provider management
 	disableProvider,
+	disableUserSource,
 	enableProvider,
+	enableUserSource,
 	getAllCapabilitiesInfo,
 	getAllProvidersInfo,
 	// Introspection
@@ -57,6 +60,7 @@ export {
 	// Initialization
 	initializeWithSettings,
 	invalidate,
+	isForeignUserProvider,
 	isProviderEnabled,
 	isUserSourceEnabled,
 	listCapabilities,

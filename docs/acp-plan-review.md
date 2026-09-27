@@ -133,6 +133,11 @@ drive it over `extMethod`:
 | `save` | Writes the plan to `savePath` (resolved against the session cwd), exits plan mode, and starts a fresh session. |
 | dismissal / `cancel` | Keeps plan mode active; the review closes without granting write access. |
 
+With `plan.autosave` enabled, execution approvals (`execute`, `compact`, and
+`keep`) also save the approved content to the configured autosave directory
+before execution. Autosave failure does not cancel approval. `save` writes only
+to the explicitly selected path and does not start execution.
+
 Execution strategies that need an idle session run at the end of the current
 turn: the proposal turn is aborted silently (mirroring the TUI's plan-approval
 abort) and the outcome executes from the `agent_end` handler, so the synthetic

@@ -13,6 +13,7 @@ import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config
 import type { ContextUsage } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import { AcpAgent } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-agent";
+import { cfgPlanAutosave, cfgPlanEnabled } from "@oh-my-pi/pi-coding-agent/plan-mode/settings";
 import {
 	PLAN_REVIEW_OPTION_LABELS,
 	parsePlanReviewAction,
@@ -172,6 +173,9 @@ class FakeAgentSession {
 			this.#listeners.delete(listener);
 		};
 	}
+	subscribeCommandMetadataChanged(): () => void {
+		return () => {};
+	}
 
 	setClientBridge(bridge: ClientBridge): void {
 		this.clientBridge = bridge;
@@ -307,7 +311,7 @@ async function createPlanSession(harness: Harness): Promise<{
 	session: FakeAgentSession;
 	planUrl: string;
 }> {
-	Settings.instance.set("plan.enabled", true);
+	cfgPlanEnabled.set(Settings.instance, true);
 	const created = await harness.agent.newSession({ cwd: harness.cwd, mcpServers: [] });
 	const session = harness.findSession(created.sessionId)!;
 	await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
@@ -492,6 +496,7 @@ describe("ACP plan review", () => {
 			});
 			try {
 				const { created, session } = await createPlanSession(harness);
+				cfgPlanAutosave.set(Settings.instance, true);
 				session.contextUsage = { tokens: 190000, contextWindow: 200000, percent: 95 };
 				const originalPrompt = session.prompt.bind(session);
 				let submitted = false;
@@ -516,6 +521,14 @@ describe("ACP plan review", () => {
 						? path.join(harness.cwd, "approved-plan.md")
 						: path.join(harness.localRoot(session.sessionId), "words-counter-plan.md");
 				expect(await Bun.file(planPath).text()).toBe("approved edit");
+				if (decision !== "save") {
+					expect(session.promptCalls[0]).toContain(
+						`<plan path="local://words-counter-plan.md">\napproved edit\n</plan>`,
+					);
+				}
+				const autosavedPath = path.join(harness.cwd, ".omp", "plans", "WORDS_COUNTER_PLAN.md");
+				expect(await Bun.file(autosavedPath).exists()).toBe(decision !== "save");
+				if (decision !== "save") expect(await Bun.file(autosavedPath).text()).toBe("approved edit");
 				expect(session.compactCalls.length).toBe(decision === "compact" ? 1 : 0);
 				expect(session.sessionId === created.sessionId).toBe(decision === "compact" || decision === "keep");
 			} finally {
@@ -669,10 +682,10 @@ describe("ACP plan review", () => {
 			const { created } = await createPlanSession(harness);
 			const params = { sessionId: created.sessionId, cwd: harness.cwd, mcpServers: [] };
 			await harness.agent.closeSession({ sessionId: created.sessionId });
-			Settings.instance.set("plan.enabled", false);
+			cfgPlanEnabled.set(Settings.instance, false);
 			expect((await harness.agent.loadSession(params)).modes?.currentModeId).toBe("default");
 			await harness.agent.closeSession({ sessionId: created.sessionId });
-			Settings.instance.set("plan.enabled", true);
+			cfgPlanEnabled.set(Settings.instance, true);
 			expect((await harness.agent.loadSession(params)).modes?.currentModeId).toBe("default");
 		} finally {
 			harness.abortController.abort();
