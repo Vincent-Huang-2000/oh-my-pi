@@ -136,3 +136,32 @@ native frames. See [native rendering](./tui-core-renderer.md#native-rendering-te
 ## Shutdown
 
 Interactive shutdown disposes session-owned work, drains terminal input, restores title/protocol state, and calls `TUI.stop()`. TUI exits any alternate buffer, asks the provider to Flush all eligible finalized history, cancels render/resize timers, preserves terminal-owned image state, places the shell cursor directly after visible TUI content, restores cursor visibility, then delegates terminal-mode restoration to `ProcessTerminal.stop()`.
+
+## Tool renderer development rules
+
+All text displayed in tool renderers must be sanitized. Raw content (file contents, error messages, tool output) breaks terminal rendering: tabs → visual holes, long lines → overflow, paths → leak home directory.
+
+**Rules:**
+
+- **Tabs → spaces** via `replaceTabs()` (from `@oh-my-pi/pi-tui` or `../tools/render-utils`).
+- **Truncate** lines with `truncateToWidth()` / `ui.truncate()`. Use `TRUNCATE_LENGTHS` constants.
+- **Shorten paths** with `shortenPath()` (replaces home with `~`).
+- **Preview limits** from `PREVIEW_LIMITS`. No ad-hoc numbers.
+
+**Apply to every render path**, not just the happy one:
+
+- Success output (file previews, command output, search results).
+- **Error messages** — these often embed file content (e.g., patch failure messages include unmatched lines). If a message contains file content, it needs `replaceTabs()`.
+- Diff content (added and removed).
+- Streaming previews.
+
+### Streaming tool previews
+
+Tool-call previews can have **multiple render paths**. If you add preview-only fields or depend on partially streamed args, update every path — not only the final renderer. Streamed argument buffers decode into display args via `decodeStreamedToolArgs` / `ToolArgsRevealController` (`packages/coding-agent/src/modes/controllers/tool-args-reveal.ts`); both the live event path and transcript rebuilds must go through them — never spread provider-parsed `arguments` next to a raw `__partialJson` (parsed args lag the stream by a throttled parse window).
+
+For the bash tool specifically:
+
+- The pending preview may need raw `partialJson`, not just parsed `arguments`. Parsed args lag until a JSON object closes, which makes inline env assignments appear only at the end.
+- Preserve preview-only fields (e.g. `__partialJson`) through `event-controller.ts`, transcript rebuilds in `ui-helpers.ts`, and merged call/result rendering in `tool-execution.ts`. Missing one path causes inconsistent previews.
+- `ToolExecutionComponent.#buildRenderContext()` for bash must work even before a result exists — the renderer uses call args plus render context to show the command preview while streaming.
+- Verify both live streaming and rebuilt transcript paths after any bash preview change. A fix in one path does not fix the other.
