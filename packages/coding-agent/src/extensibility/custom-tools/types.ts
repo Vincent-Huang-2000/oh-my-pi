@@ -19,7 +19,7 @@ import type {
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { FetchImpl, Model, Static, TSchema } from "@oh-my-pi/pi-ai";
 import type { Component } from "@oh-my-pi/pi-tui";
-import type { RenderResultOptions } from "@oh-my-pi/pi-tui/tools/renderer";
+import type { NativeToolView, RenderResultOptions } from "@oh-my-pi/pi-tui/tools/renderer";
 import type { logger as PiLogger } from "@oh-my-pi/pi-utils";
 import type { Rule } from "../../capability/rule";
 import type { ModelRegistry } from "../../config/model-registry";
@@ -213,12 +213,18 @@ export interface CustomTool<TParams extends TSchema = TSchema, TDetails = any> {
 	mcpServerName?: string;
 	/** Original MCP tool name for discovery/search metadata. */
 	mcpToolName?: string;
+	/** MCP read-only annotation, independent of the approval tier. */
+	mcpReadOnlyHint?: boolean;
 	/** Previous public name when a rename changed minting (e.g. digits kept in
 	 *  MCP names). Approval resolution honors `deny`/`prompt` keyed on it. */
 	legacyName?: string;
 
 	/** Capability tier declaration used by approval gates. Omitted means "exec". */
 	approval?: ToolApproval;
+
+	/** Exact targets an approval mode may remember for this call (`always-ask-cached`), one key per
+	 *  target, derived from the call's args. Omit it and approvals are never remembered per target. */
+	approvalCacheTargets?: (args: unknown) => readonly string[] | undefined;
 
 	/** Lines appended after the standard approval prompt header. */
 	formatApprovalDetails?: (args: unknown) => string | string[] | undefined;
@@ -250,6 +256,16 @@ export interface CustomTool<TParams extends TSchema = TSchema, TDetails = any> {
 		theme: Theme,
 		args?: Static<TParams>,
 	) => Component;
+
+	/** Semantic call view for TSP terminals (the native counterpart of {@link renderCall}). */
+	describeCall?: (args: Static<TParams>, options: RenderResultOptions) => NativeToolView | undefined;
+
+	/** Semantic result view for TSP terminals (the native counterpart of {@link renderResult}). */
+	describeResult?: (
+		result: CustomToolResult<TDetails>,
+		options: RenderResultOptions,
+		args?: Static<TParams>,
+	) => NativeToolView | undefined;
 }
 
 /** Factory function that creates a custom tool or array of tools */

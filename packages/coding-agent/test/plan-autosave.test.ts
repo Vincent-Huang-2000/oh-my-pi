@@ -6,11 +6,7 @@ import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config
 import { resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import { getSettingsForTab } from "@oh-my-pi/pi-tui/overlays/settings-defs";
 import { createSettingsHost } from "@oh-my-pi/pi-coding-agent/config/settings-ui";
-import {
-	autosaveApprovedPlan,
-	defaultPlanAutosaveDir,
-	resolvePlanAutosaveDir,
-} from "@oh-my-pi/pi-coding-agent/plan-mode/plan-autosave";
+import { autosaveApprovedPlan, resolvePlanAutosaveDir } from "@oh-my-pi/pi-coding-agent/plan-mode/plan-autosave";
 import type { PlanModeState } from "@oh-my-pi/pi-coding-agent/plan-mode/state";
 import type { PlanYolo } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import { PrewalkCoordinator, type PrewalkCoordinatorHost } from "@oh-my-pi/pi-coding-agent/session/prewalk";
@@ -59,13 +55,6 @@ describe("plan autosave settings UI", () => {
 });
 
 describe("resolvePlanAutosaveDir", () => {
-	it("defaults to <project>/.omp/plans when unset", () => {
-		const cwd = makeCwd();
-		const settings = Settings.isolated();
-		expect(resolvePlanAutosaveDir(settings, cwd)).toBe(path.join(cwd, ".omp", "plans"));
-		expect(defaultPlanAutosaveDir(cwd)).toBe(path.join(cwd, ".omp", "plans"));
-	});
-
 	it("resolves absolute, tilde, and cwd-relative custom dirs", () => {
 		const cwd = makeCwd();
 		expect(resolvePlanAutosaveDir(Settings.isolated({ "plan.autosaveDir": path.join(cwd, "custom") }), cwd)).toBe(
@@ -167,6 +156,10 @@ describe("plan-yolo approval autosave", () => {
 			settings,
 			model: () => undefined,
 			configuredThinkingLevel: () => undefined,
+			restoreThinkingLevel: () => {},
+			resolveDefaultPrewalk: () => undefined,
+			resolveAutoPrewalkTarget: () => undefined,
+			classifyAutoPrewalk: async () => undefined,
 			emitNotice: (level, message, source) => {
 				notices.push({ level, message, source });
 			},
@@ -241,5 +234,20 @@ describe("plan-yolo approval autosave", () => {
 			message: expect.stringContaining("Plan autosave failed"),
 			source: "plan-yolo",
 		});
+	});
+
+	it("leaves an extension-shadowed write out of the plan-yolo tool set (#14030)", async () => {
+		const cwd = makeCwd();
+		const t = setupPlanYolo(cwd, path.join(cwd, "artifacts"), Settings.isolated({}));
+		const applied: string[][] = [];
+		t.host.getEnabledToolNames = () => ["read", "write"];
+		t.host.setActiveToolsByName = async names => {
+			applied.push(names);
+		};
+		const coordinator = new PrewalkCoordinator(t.host, { planYolo: { target } satisfies PlanYolo });
+
+		await coordinator.armPlanYoloIfNeeded();
+
+		expect(applied).toEqual([["read"]]);
 	});
 });

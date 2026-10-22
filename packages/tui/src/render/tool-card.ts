@@ -1,10 +1,18 @@
+import type { TspSpan, TspText } from "@oh-my-pi/pi-wire";
 import { Text } from "../components/text";
+import { compactText, rowsText, styledSpans } from "../native/spans";
+import { sameItems } from "../native/memo";
+import { colorTone } from "../native/tone";
+import { span } from "../native/describe";
+import type { DescribeContext, NativeChild, NativeNode } from "../native/node";
 import type { Theme, ThemeColor } from "../theme/theme";
 import type { Component } from "../tui";
 import { getPaddingX } from "../utils";
 import {
 	CachedOutputBlock,
+	describeOutputBlock,
 	markFramedBlockComponent,
+	type NativeOutputBlockSection,
 	outputBlockContentWidth,
 	type OutputBlockOptions,
 } from "./output-block";
@@ -35,6 +43,8 @@ export interface ToolCardSnapshot {
 	/** Structured status header, rendered by the shared status-line primitive. */
 	status?: StatusLineOptions;
 	headerMeta?: string;
+	/** Short facts drawn inside the frame's bottom border (framed); a trailing row otherwise. */
+	footerMeta?: string;
 	phase?: ToolCardPhase;
 	body?: ToolCardContent;
 	sections?: readonly ToolCardSection[];
@@ -61,6 +71,11 @@ export interface ToolCardOptions {
 	paddingY?: number;
 	ignoreTight?: boolean;
 	onInvalidate?: () => void;
+	/**
+	 * Drop builder-owned memos the next build recomputes. Called by
+	 * {@link ToolCard.releaseRenderCaches}, which never calls `onInvalidate`.
+	 */
+	onReleaseRenderCaches?: () => void;
 	onDispose?: () => void;
 }
 
@@ -73,6 +88,39 @@ export function toolCardState(phase: ToolCardPhase | undefined): State | undefin
 
 function isRenderedLines(value: readonly string[] | Component): value is readonly string[] {
 	return Array.isArray(value);
+}
+
+/** Header spans for a structured status line; the status icon is the card's status chip. */
+function statusSpans(status: StatusLineOptions, theme: Theme): TspSpan[] {
+	const flatten = (text: string): string => text.replace(/\r\n?|\n/g, " ");
+	const spans: TspSpan[] = [];
+	if (status.iconOverride) spans.push(...styledSpans(status.iconOverride), span(" "));
+	spans.push(span(flatten(status.title), status.titleColor ?? "accent"));
+	if (status.description) spans.push(span(": "), span(flatten(status.description), "muted"));
+	if (status.badge) {
+		const label = `${theme.format.bracketLeft}${flatten(status.badge.label)}${theme.format.bracketRight}`;
+		spans.push(span(" "), span(label, status.badge.color));
+	}
+	const meta = status.meta?.map(flatten).filter(value => value.trim().length > 0) ?? [];
+	if (meta.length > 0) spans.push(span(" "), span(meta.join(theme.sep.dot), "dim"));
+	return spans;
+}
+
+/** Last description of a card, reused while the snapshot's inputs are unchanged. */
+interface NativeCardMemo {
+	head: string;
+	meta: string | undefined;
+	phase: ToolCardPhase | undefined;
+	applyBg: boolean | undefined;
+	borderColor: ThemeColor | undefined;
+	/** Per slot: label plus resolved content (component or rows array) and its described child. */
+	slots: readonly {
+		label: string | undefined;
+		separator: boolean;
+		content: readonly string[] | Component;
+		child: NativeChild;
+	}[];
+	node: NativeNode;
 }
 
 function resolveContent(content: ToolCardContent, width: number): { lines: readonly string[]; component?: Component } {
@@ -96,6 +144,7 @@ export class ToolCard implements Component {
 	#plainKey = "";
 	#renderedChildren: Component[] = [];
 	#disposed = false;
+	#native: NativeCardMemo | undefined;
 
 	constructor(theme: Theme, options: ToolCardOptions, build: (context: ToolCardBuildContext) => ToolCardSnapshot) {
 		this.#theme = theme;
@@ -172,6 +221,7 @@ export class ToolCard implements Component {
 				previousOptions?.width === width &&
 				previousOptions.header === header &&
 				previousOptions.headerMeta === snapshot.headerMeta &&
+				previousOptions.footerMeta === snapshot.footerMeta &&
 				previousOptions.state === state &&
 				previousOptions.applyBg === snapshot.applyBg &&
 				previousOptions.contentPaddingLeft === snapshot.contentPaddingLeft &&
@@ -183,6 +233,7 @@ export class ToolCard implements Component {
 			const blockOptions: OutputBlockOptions = reusableOptions ?? {
 				header,
 				headerMeta: snapshot.headerMeta,
+				footerMeta: snapshot.footerMeta,
 				state,
 				sections,
 				width,
@@ -204,6 +255,7 @@ export class ToolCard implements Component {
 			if (section.label) lines.push(section.label);
 			lines.push(...section.lines);
 		}
+		if (snapshot.footerMeta) lines.push(snapshot.footerMeta);
 		const text = lines.join("\n");
 		const key = `${width}:${text.length}:${Bun.hash(text).toString(36)}:${state ?? "info"}:${snapshot.applyBg ?? true}`;
 		if (key !== this.#plainKey) {
@@ -214,6 +266,101 @@ export class ToolCard implements Component {
 			);
 		}
 		return this.#plainText.render(width);
+	}
+
+	/**
+	 * A `card` (flat `inset` for plain cards) with the state's tone and status
+	 * chip, head from the header/status line, and body slots: components as
+	 * children, pre-rendered rows as unwrapped text, labelled sections as
+	 * `section`s. The builder gets the surface width as its only width.
+	 */
+	describe(cx: DescribeContext): NativeNode {
+		const snapshot = this.#build({ width: cx.cols, contentWidth: cx.cols, contentWidthFor: () => cx.cols });
+		const previous = this.#native;
+		const slotInputs: { label: string | undefined; separator: boolean; content: ToolCardContent }[] = [];
+		if (snapshot.body) slotInputs.push({ label: undefined, separator: false, content: snapshot.body });
+		for (const section of snapshot.sections ?? []) {
+			slotInputs.push({ label: section.label, separator: section.separator === true, content: section.content });
+		}
+		if (snapshot.footer)
+			slotInputs.push({ label: undefined, separator: slotInputs.length > 0, content: snapshot.footer });
+		if (snapshot.footerMeta) slotInputs.push({ label: undefined, separator: false, content: [snapshot.footerMeta] });
+
+		const nextChildren: Component[] = [];
+		const slots = slotInputs.map((input, index) => {
+			const content = typeof input.content === "function" ? input.content(cx.cols) : input.content;
+			const prior = previous?.slots[index];
+			let child: NativeChild;
+			if (isRenderedLines(content)) {
+				child =
+					prior !== undefined && isRenderedLines(prior.content) && sameItems(prior.content, content)
+						? prior.child
+						: rowsText(content);
+			} else {
+				child = content;
+				if (!nextChildren.includes(content)) nextChildren.push(content);
+			}
+			return { label: input.label, separator: input.separator, content, child };
+		});
+		for (const child of this.#renderedChildren) {
+			if (!nextChildren.includes(child)) child.dispose?.();
+		}
+		this.#renderedChildren = nextChildren;
+
+		const head = snapshot.header ?? (snapshot.status ? JSON.stringify(snapshot.status) : "");
+		if (
+			previous !== undefined &&
+			previous.head === head &&
+			previous.meta === snapshot.headerMeta &&
+			previous.phase === snapshot.phase &&
+			previous.applyBg === snapshot.applyBg &&
+			previous.borderColor === snapshot.borderColor &&
+			previous.slots.length === slots.length &&
+			slots.every((slot, index) => {
+				const prior = previous.slots[index]!;
+				return prior.label === slot.label && prior.separator === slot.separator && prior.child === slot.child;
+			})
+		) {
+			return previous.node;
+		}
+
+		const headSpans: TspText | undefined = snapshot.header
+			? compactText(styledSpans(snapshot.header))
+			: snapshot.status
+				? statusSpans(snapshot.status, this.#theme)
+				: undefined;
+		const sections: NativeOutputBlockSection[] = slots.map((slot, index) => ({
+			label: slot.label === undefined ? undefined : compactText(styledSpans(slot.label)),
+			separator: slot.separator,
+			body: [slot.child],
+			key: String(index),
+		}));
+		const state = toolCardState(snapshot.phase);
+		const plain = this.#options.variant === "plain";
+		const described = describeOutputBlock({
+			head: headSpans,
+			meta: snapshot.headerMeta ? compactText(styledSpans(snapshot.headerMeta)) : undefined,
+			state,
+			role: "omp.tool",
+			tone:
+				snapshot.borderColor !== undefined
+					? (colorTone(snapshot.borderColor) ?? "neutral")
+					: plain && snapshot.applyBg === false
+						? "neutral"
+						: undefined,
+			sections,
+			inset: plain || undefined,
+		});
+		this.#native = {
+			head,
+			meta: snapshot.headerMeta,
+			phase: snapshot.phase,
+			applyBg: snapshot.applyBg,
+			borderColor: snapshot.borderColor,
+			slots,
+			node: described,
+		};
+		return described;
 	}
 
 	get debugChildren(): readonly Component[] {
@@ -236,12 +383,23 @@ export class ToolCard implements Component {
 	}
 
 	invalidate(): void {
+		this.#native = undefined;
 		this.#block.invalidate();
 		this.#lastBlockOptions = undefined;
 		this.#plainKey = "";
 		this.#plainText.invalidate();
 		for (const child of this.#renderedChildren) child.invalidate?.();
 		this.#options.onInvalidate?.();
+	}
+
+	releaseRenderCaches(): void {
+		this.#block.invalidate();
+		this.#lastBlockOptions = undefined;
+		this.#plainKey = "";
+		this.#plainText.setText("");
+		this.#plainText.releaseRenderCaches();
+		for (const child of this.#renderedChildren) child.releaseRenderCaches?.();
+		this.#options.onReleaseRenderCaches?.();
 	}
 
 	dispose(): void {

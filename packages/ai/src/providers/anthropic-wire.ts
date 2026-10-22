@@ -180,6 +180,8 @@ export const LEGACY_COMPACTION_BETA = "compact-2026-01-12";
 export type CompactionBlockParam = {
 	type: "compaction";
 	content: string;
+	/** Opaque signed tool changes from a compaction response. */
+	tool_changes?: Record<string, unknown>[];
 	signature?: string;
 	encrypted_content?: string | null;
 	cache_control?: CacheControlEphemeral | null;
@@ -272,7 +274,18 @@ export type ThinkingConfigAdaptive = {
 	block_binding?: ThinkingBlockBinding;
 };
 
-export type ThinkingConfigParam = ThinkingConfigEnabled | ThinkingConfigDisabled | ThinkingConfigAdaptive;
+/**
+ * Sonnet 5.5's replacement for `disabled`: no up-front thinking, progress
+ * updates between tool calls only. Takes no other field, and effort above
+ * `high` is rejected alongside it.
+ */
+export type ThinkingConfigBetweenTools = { type: "between_tools" };
+
+export type ThinkingConfigParam =
+	| ThinkingConfigEnabled
+	| ThinkingConfigDisabled
+	| ThinkingConfigAdaptive
+	| ThinkingConfigBetweenTools;
 
 export type OutputConfig = {
 	/** Adaptive-thinking effort level (effort beta). */
@@ -442,7 +455,13 @@ export type ResponseContentBlock =
 	| WebSearchToolResultBlockParam
 	| ToolSearchToolResultBlockParam
 	| { type: "fallback"; from: { model: string }; to: { model: string } }
-	| { type: "compaction"; content: string; signature?: string; encrypted_content?: string | null };
+	| {
+			type: "compaction";
+			content: string;
+			signature?: string;
+			encrypted_content?: string | null;
+			tool_changes?: Record<string, unknown>[];
+	  };
 
 export type ContentBlockDelta =
 	| { type: "text_delta"; text: string }

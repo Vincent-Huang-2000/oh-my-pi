@@ -4,42 +4,47 @@ import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-c
 import { cfgComputerEnabled } from "@oh-my-pi/pi-coding-agent/tools/settings";
 
 function acpRuntime(
-	options: { enabled?: boolean; available?: boolean; display?: string; maxWidth?: number; maxHeight?: number } = {},
+	options: {
+		enabled?: boolean;
+		available?: boolean;
+		display?: string;
+		maxWidth?: number;
+		maxHeight?: number;
+		backgroundFallback?: "takeover" | "refuse";
+	} = {},
 ) {
 	const settings = Settings.isolated({
 		"computer.enabled": options.enabled ?? false,
-		"computer.display": options.display ?? "all",
+		"computer.display": options.display ?? "active",
 		"computer.maxWidth": options.maxWidth ?? 1920,
 		"computer.maxHeight": options.maxHeight ?? 1200,
+		...(options.backgroundFallback ? { "computer.backgroundFallback": options.backgroundFallback } : {}),
 	});
 	const getEvalPreludes = vi.fn(() =>
 		cfgComputerEnabled.get(settings) && options.available !== false ? [{ name: "computer" }] : [],
 	);
-	const refreshBaseSystemPrompt = vi.fn(async () => {});
 	const output = vi.fn();
 	const runtime = {
 		session: {
 			settings,
 			getEvalPreludes,
-			refreshBaseSystemPrompt,
 		},
 		output,
 	};
-	return { output, refreshBaseSystemPrompt, runtime, settings };
+	return { output, runtime, settings };
 }
 
 const enabledStatus =
-	"Computer use: enabled · prelude: active · configured: display=all, maxWidth=1920, maxHeight=1200";
+	"Computer use: enabled · prelude: active · configured: display=active, maxWidth=1920, maxHeight=1200, backgroundFallback=takeover";
 
 describe("/computer slash command", () => {
-	it("toggles a disabled session on and refreshes prelude guidance", async () => {
+	it("toggles a disabled session on without persisting", async () => {
 		const h = acpRuntime({ enabled: false });
 		expect(await Reflect.apply(executeAcpBuiltinSlashCommand, undefined, ["/computer", h.runtime])).toEqual({
 			consumed: true,
 		});
 		expect(cfgComputerEnabled.get(h.settings)).toBe(true);
 		expect(h.settings.getGlobalSettings()).toEqual({});
-		expect(h.refreshBaseSystemPrompt).toHaveBeenCalledTimes(1);
 		expect(h.output).toHaveBeenCalledWith(`Computer use enabled for this session. ${enabledStatus}`);
 	});
 
@@ -47,7 +52,6 @@ describe("/computer slash command", () => {
 		const h = acpRuntime({ enabled: true });
 		await Reflect.apply(executeAcpBuiltinSlashCommand, undefined, ["/computer", h.runtime]);
 		expect(cfgComputerEnabled.get(h.settings)).toBe(false);
-		expect(h.refreshBaseSystemPrompt).toHaveBeenCalledTimes(1);
 		expect(h.output).toHaveBeenCalledWith("Computer use disabled for this session.");
 	});
 
@@ -61,19 +65,24 @@ describe("/computer slash command", () => {
 		expect(cfgComputerEnabled.get(off.settings)).toBe(false);
 	});
 
-	it("reports status without changing settings or refreshing the prompt", async () => {
+	it("reports status without changing settings", async () => {
 		const h = acpRuntime({ enabled: true });
 		await Reflect.apply(executeAcpBuiltinSlashCommand, undefined, ["/computer status", h.runtime]);
 		expect(cfgComputerEnabled.get(h.settings)).toBe(true);
-		expect(h.refreshBaseSystemPrompt).not.toHaveBeenCalled();
 		expect(h.output).toHaveBeenCalledWith(enabledStatus);
 	});
 
 	it("reports configured values", async () => {
-		const h = acpRuntime({ enabled: true, display: "display-2", maxWidth: 1600, maxHeight: 900 });
+		const h = acpRuntime({
+			enabled: true,
+			display: "display-2",
+			maxWidth: 1600,
+			maxHeight: 900,
+			backgroundFallback: "refuse",
+		});
 		await Reflect.apply(executeAcpBuiltinSlashCommand, undefined, ["/computer status", h.runtime]);
 		expect(h.output).toHaveBeenCalledWith(
-			"Computer use: enabled · prelude: active · configured: display=display-2, maxWidth=1600, maxHeight=900",
+			"Computer use: enabled · prelude: active · configured: display=display-2, maxWidth=1600, maxHeight=900, backgroundFallback=refuse",
 		);
 	});
 
@@ -82,7 +91,6 @@ describe("/computer slash command", () => {
 		await Reflect.apply(executeAcpBuiltinSlashCommand, undefined, ["/computer on", h.runtime]);
 		expect(cfgComputerEnabled.get(h.settings)).toBe(false);
 		expect(h.settings.getGlobalSettings()).toEqual({});
-		expect(h.refreshBaseSystemPrompt).not.toHaveBeenCalled();
 		expect(h.output).toHaveBeenCalledWith("Computer use is unavailable in this session.");
 	});
 

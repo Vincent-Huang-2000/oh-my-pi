@@ -1,14 +1,14 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import {
-	getActiveProfile,
-	getAgentDir,
-	getProfileRootDir,
-	isEnoent,
-	logger,
-	stringifyYamlConfig,
-} from "@oh-my-pi/pi-utils";
+// Subpaths, not the `@oh-my-pi/pi-utils` barrel: the barrel loads the native
+// addon (file-lock), and key-hint formatting runs on addon-free CLI paths
+// (`omp --version`, help) through cli/command-help.ts.
+import { getActiveProfile, getAgentDir, getProfileRootDir } from "@oh-my-pi/pi-utils/dirs";
+import { isEnoent } from "@oh-my-pi/pi-utils/fs-error";
+import * as logger from "@oh-my-pi/pi-utils/logger";
+import { stringifyYamlConfig } from "@oh-my-pi/pi-utils/yaml-config";
 import { JSONC, YAML } from "bun";
+import { formatKeyHints } from "./key-hint-format";
 import {
 	type Keybinding,
 	type KeybindingDefinitions,
@@ -37,6 +37,8 @@ interface AppKeybindings {
 	"app.model.selectTemporary": true;
 	"app.tools.expand": true;
 	"app.tools.toggleVisibility": true;
+	"app.ask.hide": true;
+	"app.approval.approve": true;
 	"app.editor.external": true;
 	"app.message.followUp": true;
 	"app.retry": true;
@@ -56,10 +58,11 @@ interface AppKeybindings {
 	"app.session.rename": true;
 	"app.session.delete": true;
 	"app.session.deleteNoninvasive": true;
-	"app.tree.foldOrUp": true;
-	"app.tree.unfoldOrDown": true;
+	"app.tree.previousBranch": true;
+	"app.tree.nextBranch": true;
 	"app.plan.toggle": true;
 	"app.history.search": true;
+	"app.stt.pushToTalk": true;
 	"app.stt.toggle": true;
 	"app.live.toggle": true;
 }
@@ -136,6 +139,16 @@ export const KEYBINDINGS = {
 	"app.tools.toggleVisibility": {
 		defaultKeys: "ctrl+shift+o",
 		description: "Show or hide tool activity",
+	},
+	"app.ask.hide": {
+		defaultKeys: "alt+h",
+		description: "Hide or show a pending ask dialog",
+	},
+	"app.approval.approve": {
+		// A chord, not Enter: an Enter typed for the composer as the prompt appears must not approve.
+		// Ctrl+Q backs up Ctrl+Enter, which Windows Terminal cannot deliver (#1903).
+		defaultKeys: ["ctrl+enter", "ctrl+q"],
+		description: "Approve a pending tool call",
 	},
 	"app.editor.external": {
 		defaultKeys: "ctrl+g",
@@ -221,13 +234,13 @@ export const KEYBINDINGS = {
 		defaultKeys: "ctrl+backspace",
 		description: "Delete session (non-invasive)",
 	},
-	"app.tree.foldOrUp": {
-		defaultKeys: ["ctrl+left", "alt+left"],
-		description: "Fold or move up",
+	"app.tree.previousBranch": {
+		defaultKeys: [],
+		description: "Jump to the previous branch in /tree",
 	},
-	"app.tree.unfoldOrDown": {
-		defaultKeys: ["ctrl+right", "alt+right"],
-		description: "Unfold or move down",
+	"app.tree.nextBranch": {
+		defaultKeys: [],
+		description: "Jump to the next branch in /tree",
 	},
 	"app.plan.toggle": {
 		defaultKeys: "alt+shift+p",
@@ -237,9 +250,13 @@ export const KEYBINDINGS = {
 		defaultKeys: "ctrl+r",
 		description: "Search history",
 	},
+	"app.stt.pushToTalk": {
+		defaultKeys: "space",
+		description: "Hold to record speech-to-text",
+	},
 	"app.stt.toggle": {
 		defaultKeys: [],
-		description: "Toggle speech-to-text (default gesture: hold Space)",
+		description: "Toggle speech-to-text recording",
 	},
 	"app.live.toggle": {
 		defaultKeys: "ctrl+l",
@@ -645,12 +662,9 @@ export class KeybindingsManager extends TuiKeybindingsManager {
 		return this.getResolvedBindings();
 	}
 
-	/**
-	 * Get display string for a keybinding (e.g., "ctrl+c/escape").
-	 */
+	/** Display string for a keybinding's keys (see {@link formatKeyHints}); empty when unbound. */
 	getDisplayString(keybinding: Keybinding): string {
-		const keys = this.getKeys(keybinding);
-		return formatKeyHints(keys.length === 0 ? [] : keys);
+		return formatKeyHints(this.getKeys(keybinding));
 	}
 
 	/**
@@ -664,97 +678,7 @@ export class KeybindingsManager extends TuiKeybindingsManager {
 	}
 }
 
-/**
- * Key hint formatting utilities for UI labels.
- *
- * Modifier labels are platform-aware: macOS names the physical keys `Option`
- * (`alt`) and `Cmd` (`super`), so rendering `Alt`/`Super` there would name keys
- * absent from a Mac keyboard. Every other platform keeps `Alt`/`Super`.
- */
-
-/**
- * Platform override for key-hint rendering; `undefined` resolves to the host
- * `process.platform`. Mirrors `setKittyProtocolActive` in the TUI keys module:
- * a single seam that keeps hint output deterministic in tests without mutating
- * the global `process.platform`.
- */
-let keyHintPlatformOverride: NodeJS.Platform | undefined;
-
-/** Pin the platform used to render modifier labels (test seam). */
-export function setKeyHintPlatform(platform: NodeJS.Platform | undefined): void {
-	keyHintPlatformOverride = platform;
-}
-
-/** Platform currently used for key-hint rendering. */
-export function keyHintPlatform(): NodeJS.Platform {
-	return keyHintPlatformOverride ?? process.platform;
-}
-
-type Modifier = "ctrl" | "shift" | "alt" | "super";
-
-function isModifier(part: string): part is Modifier {
-	return part === "ctrl" || part === "shift" || part === "alt" || part === "super";
-}
-
-/**
- * Human label for a modifier, using each platform's own key names. `ctrl` and
- * `shift` are the same everywhere; `alt`/`super` become `Option`/`Cmd` on macOS.
- */
-export function modifierLabel(mod: Modifier, platform: NodeJS.Platform = keyHintPlatform()): string {
-	switch (mod) {
-		case "ctrl":
-			return "Ctrl";
-		case "shift":
-			return "Shift";
-		case "alt":
-			return platform === "darwin" ? "Option" : "Alt";
-		case "super":
-			return platform === "darwin" ? "Cmd" : "Super";
-	}
-}
-
-const KEY_LABELS: Record<string, string> = {
-	esc: "Esc",
-	escape: "Esc",
-	enter: "Enter",
-	return: "Enter",
-	space: "Space",
-	tab: "Tab",
-	backspace: "Backspace",
-	delete: "Delete",
-	home: "Home",
-	end: "End",
-	pageup: "PgUp",
-	pagedown: "PgDn",
-	up: "Up",
-	down: "Down",
-	left: "Left",
-	right: "Right",
-};
-
-function formatKeyPart(part: string, platform: NodeJS.Platform): string {
-	const lower = part.toLowerCase();
-	if (isModifier(lower)) return modifierLabel(lower, platform);
-	const label = KEY_LABELS[lower];
-	if (label) return label;
-	if (part.length === 1) return part.toUpperCase();
-	return `${part.charAt(0).toUpperCase()}${part.slice(1)}`;
-}
-
-/** Format a key chord with human-readable, platform-aware modifier labels. */
-export function formatKeyHint(key: KeyId): string {
-	const platform = keyHintPlatform();
-	return key
-		.split("+")
-		.map(part => formatKeyPart(part, platform))
-		.join("+");
-}
-
-/** Format alternative key chords as slash-separated human-readable hints. */
-export function formatKeyHints(keys: KeyId | KeyId[]): string {
-	const list = Array.isArray(keys) ? keys : [keys];
-	return list.map(formatKeyHint).join("/");
-}
+export * from "./key-hint-format";
 
 export type { Keybinding, KeybindingsConfig, KeyId };
 export { migrateKeybindingsConfigFile };

@@ -37,12 +37,19 @@ describe("print mode disposes the session before terminating", () => {
 			sessionManager: {
 				buildSessionContext: () => ({ messages: [] }),
 				getEntries: () => [],
-				// Print mode subscribes to store failures (issue #11493).
+				// Print mode subscribes to store failures (issue #11493) and session moves.
 				onPersistenceError: () => () => {},
+				onPersistenceNotice: () => () => {},
 			},
+			// A prompt must be admitted for the persisted assistant error to count
+			// as this run's terminal failure; print mode no longer reuses the
+			// previous turn's outcome when every input was consumed locally.
+			prompt: async () => {},
 			state: { messages: [errorMsg] },
 			getLastAssistantMessage: () => errorMsg,
+			disableStopTimeTodoReminders: () => {},
 			prepareForHeadlessAdvisorDrain: () => {},
+			waitForIdle: async () => {},
 			setTextOutputCommitted: () => {},
 			waitForAdvisorCatchup: async () => {
 				order.push("catchup");
@@ -66,17 +73,20 @@ describe("print mode disposes the session before terminating", () => {
 		try {
 			// No `process.exit` spy: the contract is that runPrintMode never exits
 			// the process itself, it returns the code for the caller to use.
-			expect(await runPrintMode(session, { mode: "text" })).toBe(1);
+			expect(await runPrintMode(session, { mode: "text", messages: ["continue"] })).toBe(1);
 		} finally {
 			stderrSpy.mockRestore();
 			flushSpy.mockRestore();
 		}
 
-		expect(order).toEqual(["catchup", "flush", "dispose", "stderr"]);
+		// "Working..." (the text-mode admission indicator) precedes the
+		// terminal error line; dispose still lands before the error stderr.
+		expect(order).toEqual(["stderr", "catchup", "flush", "dispose", "stderr"]);
 		expect(stderrLines.join("")).toContain("boom");
 	});
 
-	it("disposes an active print session before SIGTERM exits", async () => {
+	// Windows cannot deliver a catchable SIGTERM via process.kill: libuv terminates the process outright.
+	it.skipIf(process.platform === "win32")("disposes an active print session before SIGTERM exits", async () => {
 		using tempDir = TempDir.createSync("@omp-print-signal-");
 		const marker = tempDir.join("disposed");
 		const fixture = path.join(import.meta.dir, "..", "fixtures", "print-mode-signal.js");
@@ -117,9 +127,12 @@ describe("print mode disposes the session before terminating", () => {
 				buildSessionContext: () => ({ messages: [] }),
 				getEntries: () => [],
 				onPersistenceError: () => () => {},
+				onPersistenceNotice: () => () => {},
 			},
 			getLastAssistantMessage: () => abortedMsg,
+			disableStopTimeTodoReminders: () => {},
 			prepareForHeadlessAdvisorDrain: () => {},
+			waitForIdle: async () => {},
 			setTextOutputCommitted: () => {},
 			waitForAdvisorCatchup: async () => true,
 			// Mimic a real mid-turn signal: the postmortem teardown fires (which

@@ -21,10 +21,18 @@ import {
 	buildExecutionFrame,
 	buildStatusFooter,
 	clampDisplayLine,
+	describeExecutionCard,
+	describeExecutionTool,
+	type ExecutionColorKey,
 	type ExecutionStatus,
 	PREVIEW_LINES,
 	resolveExecutionStatus,
 } from "./execution-shared";
+import { span, text } from "../native/describe";
+import { type DescribeContext, type NativeNode, type NativeUiEvent, rootToggleExpanded } from "../native/node";
+import { NativeImageCache } from "../native/blobs";
+import { imageLinksEnabled, linkedImageSpan, linkedImageText } from "../prompt/image-references";
+import { Memo } from "../native/memo";
 
 const STREAMING_LINE_CAP = PREVIEW_LINES * 5;
 // Minimum interval between processing incoming chunks for display (ms).
@@ -78,6 +86,13 @@ export class BashExecutionComponent extends Container {
 	#showImages = true;
 	readonly #instanceId = nextBashExecutionId++;
 	readonly #command: string;
+	readonly #colorKey: ExecutionColorKey;
+	readonly #startedAt = performance.now();
+	#endedAt: number | undefined;
+	// Bumped whenever the displayed output lines change.
+	#outputVersion = 0;
+	readonly #native = new Memo();
+	readonly #nativeImages = new NativeImageCache();
 
 	constructor(command: string, ui: TUI, excludeFromContext = false) {
 		super();
@@ -86,6 +101,7 @@ export class BashExecutionComponent extends Container {
 
 		// Use dim border for excluded-from-context commands (!! prefix)
 		const colorKey = excludeFromContext ? "dim" : "bashMode";
+		this.#colorKey = colorKey;
 		const { contentContainer, loader } = buildExecutionFrame(this, ui, colorKey);
 		this.#contentContainer = contentContainer;
 		this.#loader = loader;
@@ -136,6 +152,72 @@ export class BashExecutionComponent extends Container {
 		this.#updateDisplay();
 	}
 
+	handleNativeEvent(event: NativeUiEvent): void {
+		const expanded = rootToggleExpanded(event);
+		if (expanded !== undefined) this.setExpanded(expanded);
+	}
+
+	/**
+	 * The agent's bash `tool` frame (role `omp.bash`) with a `you` badge: the
+	 * command in the head, the output as an `ansi` mini terminal following its
+	 * tail. Terminals without the `tool` kind get a `card` headed by the
+	 * command.
+	 */
+	override describe(cx?: DescribeContext): NativeNode {
+		const dataFirst = cx?.supports("tool") === true;
+		const key = [
+			dataFirst,
+			this.#outputVersion,
+			this.#blockVersion,
+			this.#status,
+			this.#expanded,
+			this.#showImages,
+			this.#images.length,
+			// Image nodes and placeholders carry links only under an enabled policy.
+			imageLinksEnabled(),
+		];
+		return this.#native.get(key, () => {
+			const images = this.#images.map((image, index) =>
+				this.#showImages
+					? this.#nativeImages.get(`img${index}`, image.data, image.mimeType)
+					: text([
+							linkedImageSpan(
+								imageFallback(image.mimeType, getImageDimensions(image.data, image.mimeType) ?? undefined),
+								image,
+								undefined,
+								"muted",
+							),
+						]),
+			);
+			const common = {
+				role: "omp.bash",
+				status: this.#status,
+				startedAt: this.#startedAt,
+				expanded: this.#expanded,
+				output: this.#outputLines.join("\n"),
+				images,
+				exitCode: this.#exitCode,
+				truncation: this.#truncation,
+				artifactError: this.#artifactError,
+			};
+			return dataFirst
+				? describeExecutionTool({
+						...common,
+						name: "bash",
+						title: "Bash",
+						command: this.#command,
+						lang: "bash",
+						excluded: this.#colorKey === "dim",
+						endedAt: this.#endedAt,
+					})
+				: describeExecutionCard({
+						...common,
+						head: [span(`$ ${this.#command}`, `${this.#colorKey} strong`)],
+						muted: this.#colorKey === "dim",
+					});
+		});
+	}
+
 	appendOutput(chunk: string): void {
 		if (this.#ptyMode) return;
 		// During high-throughput output (e.g. seq 1 500M), processing every
@@ -165,6 +247,7 @@ export class BashExecutionComponent extends Container {
 		}
 
 		this.#displayDirty = true;
+		this.#outputVersion++;
 	}
 
 	/** Switch to PTY rendering and feed raw terminal bytes through the vterm replay. */
@@ -240,6 +323,7 @@ export class BashExecutionComponent extends Container {
 		const base = theme.getFgAnsi("muted");
 		this.#outputLines = rows.map(row => (row ? styleTerminalRow(row, base) : ""));
 		this.#displayDirty = true;
+		this.#outputVersion++;
 	}
 
 	/** Final full-scrollback read; the terminal is disposed once lines are snapshotted. */
@@ -268,6 +352,7 @@ export class BashExecutionComponent extends Container {
 	): void {
 		this.#exitCode = exitCode;
 		this.#status = resolveExecutionStatus(exitCode, cancelled);
+		this.#endedAt ??= performance.now();
 		this.#truncation = options?.truncation;
 		this.#artifactError = options?.artifactError;
 		this.#images = options?.images ?? [];
@@ -338,7 +423,7 @@ export class BashExecutionComponent extends Container {
 			} else {
 				const dimensions = getImageDimensions(image.data, image.mimeType) ?? undefined;
 				this.#contentContainer.addChild(
-					new Text(theme.fg("muted", imageFallback(image.mimeType, dimensions)), 1, 0),
+					new Text(theme.fg("muted", linkedImageText(imageFallback(image.mimeType, dimensions), image)), 1, 0),
 				);
 			}
 		}
@@ -376,6 +461,7 @@ export class BashExecutionComponent extends Container {
 	#setOutput(output: string): void {
 		const clean = sanitizeWithOptionalSixelPassthrough(output, sanitizeText);
 		this.#outputLines = clean ? this.#clampLinesPreservingSixel(clean.split("\n")) : [];
+		this.#outputVersion++;
 	}
 
 	/**

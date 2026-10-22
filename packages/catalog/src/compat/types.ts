@@ -213,6 +213,8 @@ export interface CompiledRule {
 	providers?: string[];
 	/** Request adapter identifiers matched by an `on-api` selector. */
 	apis?: string[];
+	/** Selected upstream behind a deployment, matched by `on-upstream`. */
+	upstreams?: string[];
 	family?: string;
 	revision?: CompiledRevisionTerm[];
 	models?: CompiledSelector[];
@@ -270,6 +272,8 @@ export interface CompiledCursorParameter {
 /** One provider quota-scope table. */
 export interface CompiledQuotaRule {
 	provider: string;
+	/** Tier used when no exact or fallback membership matches. */
+	defaultTier?: string;
 	tiers: { label: string; models: string[] }[];
 	fallbacks: { label: string; substring: string }[];
 }
@@ -348,6 +352,8 @@ export interface CompiledBehavior {
 	retryResetTimezones: CompiledRetryResetTimezone[];
 	retiredProviders: string[];
 	referenceIsolatedProviders: string[];
+	/** Built-in model selector chains per agent role, keyed by role in declaration order. */
+	roleDefaults: Record<string, string[]>;
 }
 
 /**
@@ -375,8 +381,17 @@ export type CompiledAuthValidation =
 			maxTokensField?: "max_tokens" | "max_completion_tokens";
 			maxTokens?: number;
 			optional?: boolean;
+			/** With `optional`: a 403 also trusts the key; only a 401 rejects it. */
+			trustForbidden?: boolean;
 	  }
-	| { kind: "anthropic-messages"; label?: string; baseUrl: string; model: string; optional?: boolean }
+	| {
+			kind: "anthropic-messages";
+			label?: string;
+			baseUrl: string;
+			model: string;
+			optional?: boolean;
+			trustForbidden?: boolean;
+	  }
 	| {
 			kind: "models-endpoint";
 			label?: string;
@@ -386,6 +401,7 @@ export type CompiledAuthValidation =
 			/** Hook returning extra request headers (may throw a configuration error). */
 			headersHook?: string;
 			optional?: boolean;
+			trustForbidden?: boolean;
 	  };
 
 /** Paste-an-API-key login: optional browser hint, prompt, optional validation. */
@@ -581,8 +597,9 @@ export interface CompiledAuth {
  * - `always`: every regeneration; same-id upstream/discovery rows win dedup.
  * - `fallback`: only when authoritative catalog discovery did not succeed.
  * - `empty`: only when no other source produced a row for the provider.
+ * - `never`: runtime-only; the provider's model manager is the sole consumer.
  */
-export type SeedBundlePolicy = "always" | "fallback" | "empty";
+export type SeedBundlePolicy = "always" | "fallback" | "empty" | "never";
 
 /** Catalog-generation discovery settings (`discovery` node in `providers/<id>.kdl`). */
 export interface CompiledProviderDiscovery {
@@ -610,6 +627,8 @@ export interface CompiledSeedModel {
 	baseUrl: string;
 	reasoning: boolean;
 	input: ("text" | "image")[];
+	/** Wire model id sent upstream when it differs from the row id (`request-model-id`). */
+	requestModelId?: string;
 	supportsTools?: boolean;
 	cost: TokenCost;
 	contextWindow: number | null;
@@ -641,6 +660,8 @@ export interface CompiledProvider {
 	id: string;
 	/** Preferred model id when no explicit selection is made. */
 	defaultModel: string;
+	/** Whether the provider participates in automatic default selection (defaults to true). */
+	automaticDefault?: boolean;
 	/** Env vars consulted, in order, for the runtime API-key fallback. */
 	envVars?: string[];
 	/** The runtime creates a model manager even without a valid API key. */
@@ -649,6 +670,8 @@ export interface CompiledProvider {
 	dynamicModelsAuthoritative?: boolean;
 	/** Generator backfills never copy reasoning/input/limits from same-id rows on other hosts. */
 	skipCrossProviderReferenceFills?: boolean;
+	/** Runtime discovery keeps a bundled row's display name instead of the live one. */
+	keepBundledNames?: boolean;
 	/** Present only for providers enrolled in `generate-models.ts` discovery. */
 	discovery?: CompiledProviderDiscovery;
 	/** Non-chat model kinds mapped to their runtime transport APIs. */
@@ -693,6 +716,8 @@ export interface ResolveTarget {
 	provider: string;
 	/** Request adapter used to serialize the model. */
 	api: string;
+	/** Actual upstream chosen for this request, not the deployment provider. */
+	upstream?: string;
 	/** Centrally classified vendor lineage. */
 	class: string;
 	/** Classified product family within the class, when known. */
@@ -718,4 +743,25 @@ export interface ResolvedAxes {
 	 * wire contracts depending on whether it came from discovery or the bake.
 	 */
 	reasoning: boolean;
+}
+
+/** Selected-route request dialect. Absent fields impose no deployment override. */
+export interface RequestPolicy {
+	completionsReasoningMode?: "none" | "effort" | "opt-in" | "forced-on";
+	completionsReasoningHistory?: "omit" | "preserved" | "interleaved";
+	anthropicThinking?: "adaptive" | "adaptive-summarized" | "budget-interleaved" | "budget-effort";
+	/** Advertise `fine-grained-tool-streaming-2025-05-14` on requests that carry tools. */
+	anthropicToolStreamingBeta?: boolean;
+	/** `OpenAI-Platform` header value the route sends on OpenAI-family wires. */
+	openaiPlatformHeader?: string;
+	responsesCacheRetention?: boolean;
+	responsesVerbosity?: "low";
+	responsesServiceTier?: "priority";
+	responsesParallelToolCalls?: boolean;
+	responsesSafetyIdentifier?: boolean;
+	/** Default `tool_choice` to `auto` when the request carries tools and the caller picks none. */
+	responsesToolChoiceAuto?: boolean;
+	googleThinking?: "level" | "level-medium";
+	/** The route locks its upstream for the session (`x-provider-routing-source: session_lock`). */
+	routingSessionLock?: boolean;
 }

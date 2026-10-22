@@ -8,6 +8,7 @@ import { scheduler } from "node:timers/promises";
 import { type } from "@oh-my-pi/omptype";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import {
+	ensureAntigravityVersion,
 	getAntigravityModelWireProfile,
 	getAntigravityUserAgent,
 	getGeminiCliHeaders,
@@ -35,6 +36,7 @@ import { armPreResponseTimeout, getStreamFirstEventTimeoutMs, iterateWithIdleTim
 // the stream provider trusts the access token threaded through `options.apiKey`.
 import { normalizeSchemaForCCA } from "../utils/schema";
 import { StreamMarkupHealing, type StreamMarkupHealingEvent } from "../utils/stream-markup-healing";
+import { prepareAnthropicImageContext } from "./anthropic-images";
 import forcedToolDirective from "./google-antigravity-forced-tool.md" with { type: "text" };
 import type { Content, FunctionCallingConfigMode, ThinkingConfig } from "./google-shared";
 import {
@@ -45,6 +47,7 @@ import {
 	hasMeaningfulGoogleContent,
 	isThinkingPart,
 	MAX_EMPTY_STREAM_RETRIES,
+	mapGoogleUsage,
 	mapStopReasonString,
 	mapToolChoice,
 	nextToolCallId,
@@ -571,11 +574,23 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 				endpoints = baseUrl ? [baseUrl] : [DEFAULT_ENDPOINT];
 			}
 
-			let requestBody = buildRequest(model, context, projectId, options, isAntigravity);
+			// A host that declares an image contract (Claude behind Antigravity)
+			// rejects oversized images, and a rejected image stays in context, so
+			// clamp before building; readers without one take images as sent. The
+			// cost is one pass over the context, as on `anthropic-messages`: images
+			// already within bounds hit the per-image cache and are not decoded.
+			const requestContext =
+				model.compat.maxImageDimension !== undefined || model.compat.maxImagePayloadBytes !== undefined
+					? await prepareAnthropicImageContext(context, model)
+					: context;
+			let requestBody = buildRequest(model, requestContext, projectId, options, isAntigravity);
 			const replacementPayload = await options?.onPayload?.(requestBody, model);
 			if (replacementPayload !== undefined) {
 				requestBody = replacementPayload as typeof requestBody;
 			}
+			// The backend gates newer models on the client version; a process that
+			// skipped discovery (fresh model cache) must still send the current one.
+			if (isAntigravity) await ensureAntigravityVersion(options?.fetch ?? fetch, options?.signal);
 			const headers = isAntigravity ? { "User-Agent": getAntigravityUserAgent() } : getGeminiCliHeaders(model.id);
 
 			const requestHeaders = {
@@ -750,9 +765,16 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 				const responseSignal = options?.signal
 					? AbortSignal.any([options.signal, responseAbortController.signal])
 					: responseAbortController.signal;
+				const onSseEvent = options?.onSseEvent;
 				const chunks = iterateWithIdleTimeout(
-					readSseJson<CloudCodeAssistResponseChunk>(activeResponse.body, responseSignal, event =>
-						options?.onSseEvent?.({ event: event.event, data: event.data, raw: [...event.raw] }, model),
+					// Attach the observer only when a diagnostic listener exists: any
+					// observer turns on per-line raw capture in `readSseJson`.
+					readSseJson<CloudCodeAssistResponseChunk>(
+						activeResponse.body,
+						responseSignal,
+						onSseEvent
+							? event => onSseEvent({ event: event.event, data: event.data, raw: [...event.raw] }, model)
+							: undefined,
 					),
 					{
 						firstItemTimeoutMs: firstEventTimeoutMs,
@@ -873,25 +895,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 					}
 
 					if (responseData.usageMetadata) {
-						// promptTokenCount includes cachedContentTokenCount, so subtract to get fresh input
-						const promptTokens = responseData.usageMetadata.promptTokenCount || 0;
-						const cacheReadTokens = responseData.usageMetadata.cachedContentTokenCount || 0;
-						const thinkingTokens = responseData.usageMetadata.thoughtsTokenCount || 0;
-						output.usage = {
-							input: promptTokens - cacheReadTokens,
-							output: (responseData.usageMetadata.candidatesTokenCount || 0) + thinkingTokens,
-							cacheRead: cacheReadTokens,
-							cacheWrite: 0,
-							totalTokens: responseData.usageMetadata.totalTokenCount || 0,
-							...(thinkingTokens > 0 ? { reasoningTokens: thinkingTokens } : {}),
-							cost: {
-								input: 0,
-								output: 0,
-								cacheRead: 0,
-								cacheWrite: 0,
-								total: 0,
-							},
-						};
+						output.usage = mapGoogleUsage(responseData.usageMetadata);
 						calculateCost(model, output.usage, output.timestamp);
 					}
 				}
@@ -1387,7 +1391,6 @@ export function buildRequest(
 			request,
 			model: wireModelId,
 			userAgent: "antigravity",
-			requestType: "agent",
 		};
 	}
 

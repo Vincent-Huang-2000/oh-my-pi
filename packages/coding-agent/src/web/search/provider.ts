@@ -25,6 +25,7 @@ const PROVIDER_LOADERS: ProviderRegistry<SearchEngineId> = {
 	tavily: () => import("./providers/tavily").then(m => new m.TavilyProvider()),
 	firecrawl: () => import("./providers/firecrawl").then(m => new m.FirecrawlProvider()),
 	brave: () => import("./providers/brave").then(m => new m.BraveProvider()),
+	deepseek: () => import("./providers/deepseek").then(m => new m.DeepSeekProvider()),
 	kimi: () => import("./providers/kimi").then(m => new m.KimiProvider()),
 	parallel: () => import("./providers/parallel").then(m => new m.ParallelProvider()),
 	synthetic: () => import("./providers/synthetic").then(m => new m.SyntheticProvider()),
@@ -44,6 +45,7 @@ const GROUNDED_PROVIDER_LOADERS: ProviderRegistry<WebSearchGrounding> = {
 	codex: () => import("./providers/codex").then(m => new m.CodexProvider()),
 	xai: () => import("./providers/xai").then(m => new m.XAIProvider()),
 	openrouter: () => import("./providers/openrouter").then(m => new m.OpenRouterGroundedProvider()),
+	openai: () => import("./providers/openai").then(m => new m.OpenAIProvider()),
 };
 
 const providerInstances = new Map<string, Promise<SearchProvider>>();
@@ -82,7 +84,8 @@ export function formatSearchProviderFailures(
 	return failures.map(f => `${f.provider.id}: ${formatSearchProviderFailure(f.error, f.provider)}`).join("; ");
 }
 
-function isRegisteredSearchEngine(id: string): id is SearchEngineId {
+/** Whether `id` names a pure search engine exposed as a `web/<id>` catalog model. */
+export function isRegisteredSearchEngine(id: string): id is SearchEngineId {
 	return Object.hasOwn(PROVIDER_LOADERS, id);
 }
 

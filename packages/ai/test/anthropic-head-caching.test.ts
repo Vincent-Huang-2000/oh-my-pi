@@ -18,6 +18,7 @@ import { streamAnthropic } from "@oh-my-pi/pi-ai/providers/anthropic";
 import type { AssistantMessage, CacheRetention, Context, Message, Model, ModelSpec } from "@oh-my-pi/pi-ai/types";
 import { markPerCallContextMessage } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { requestBodyText } from "@oh-my-pi/pi-ai/utils/request-body";
 
 const MODEL_SPEC: ModelSpec<"anthropic-messages"> = {
 	id: "claude-sonnet-4-5",
@@ -59,7 +60,7 @@ async function captureWireBody(
 ): Promise<MessageCreateParams> {
 	let body: MessageCreateParams | undefined;
 	const fetchMock = (async (_input: string | URL | Request, init?: RequestInit) => {
-		body = JSON.parse(String(init?.body ?? "{}")) as MessageCreateParams;
+		body = JSON.parse(requestBodyText(init) ?? "{}") as MessageCreateParams;
 		return new Response(
 			JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "captured" } }),
 			{ status: 400, headers: { "Content-Type": "application/json" } },
@@ -231,9 +232,67 @@ describe("anthropic head caching (general API-key path)", () => {
 		expect(second).toBeGreaterThan(first);
 	});
 
-	it("stays within Anthropic's 4-breakpoint budget", async () => {
-		const body = await captureWireBody();
+	it("pins checkpoints across an interior per-call mark in a long conversation", async () => {
+		// 32 conversational turns with a per-call context message inserted
+		// between turns 20 and 21. The mark splits the request into a stable
+		// prefix (turns 1-20) whose bytes repeat next turn and a rebuilt tail
+		// (turns 21-32 plus the current request) that does not, so placement
+		// across it is the case a single backward walk has to get right: the
+		// decimation checkpoint belongs to a turn BEHIND the mark, the
+		// sub-prefix anchor to the newest message before it, and the rolling
+		// tail anchor to the newest message of all — never to the mark itself.
+		const messages: Message[] = [];
+		for (let i = 1; i <= 32; i++) {
+			messages.push({ role: "user", content: `user ${i}`, timestamp: i * 2 });
+			messages.push(assistantMessage(`assistant ${i}`, i * 2 + 1));
+		}
+		const perCallMessage: Message = { role: "developer", content: "per-call context", timestamp: 99 };
+		markPerCallContextMessage(perCallMessage);
+		// Between assistant 20 (index 39) and user 21 (index 40): the mark takes
+		// wire index 40 and shifts every later turn by one.
+		messages.splice(40, 0, perCallMessage);
+
+		const body = await captureWireBody(undefined, { ...CONTEXT, tools: [], messages });
+		// 65 conversation messages plus the `Continue.` pad the converter appends
+		// behind the trailing assistant.
+		expect(body.messages).toHaveLength(66);
 		expect(countCacheBreakpoints(body)).toBeLessThanOrEqual(4);
+		// Turn i sits at wire index 2*(i-1) before the mark and 2*(i-1)+1 after:
+		// 39 = assistant 20, the newest message before the mark; 28 = user 15, the
+		// decimation checkpoint inside the stable prefix; 64 = assistant 32, the
+		// rolling tail anchor. Nothing lands on the mark at 40.
+		expect(findCachedMessageIndices(body)).toEqual([28, 39, 64]);
+
+		// With tools sent, the tool definition takes one of the four breakpoints
+		// and the budget runs out before the sub-prefix anchor.
+		const withTools = await captureWireBody(undefined, { ...CONTEXT, messages });
+		expect(findCachedMessageIndices(withTools)).toEqual([28, 64]);
+	});
+
+	it("bounds the stable prefix at the oldest of several per-call marks", async () => {
+		// 40 turns with per-call marks after turns 32 and 36. Only the prefix
+		// before the OLDEST mark repeats next request, so decimation counts and
+		// the sub-prefix anchor must both come from turns 1-32, not 1-36.
+		const messages: Message[] = [];
+		for (let i = 1; i <= 40; i++) {
+			messages.push({ role: "user", content: `user ${i}`, timestamp: i * 2 });
+			messages.push(assistantMessage(`assistant ${i}`, i * 2 + 1));
+		}
+		const mark = (timestamp: number): Message => {
+			const message: Message = { role: "developer", content: "per-call context", timestamp };
+			markPerCallContextMessage(message);
+			return message;
+		};
+		// After assistant 36 (index 71) first, so the earlier splice index holds.
+		messages.splice(72, 0, mark(98));
+		messages.splice(64, 0, mark(99));
+
+		const body = await captureWireBody(undefined, { ...CONTEXT, systemPrompt: [], tools: [], messages });
+		expect(countCacheBreakpoints(body)).toBeLessThanOrEqual(4);
+		// 28 = user 15 and 58 = user 30 (decimation inside turns 1-32); 63 =
+		// assistant 32, the newest message before the oldest mark; 81 = the
+		// rolling tail anchor.
+		expect(findCachedMessageIndices(body)).toEqual([28, 58, 63, 81]);
 	});
 
 	it("adds no breakpoints when caching is disabled", async () => {
@@ -629,14 +688,15 @@ describe("anthropic head caching (general API-key path)", () => {
 		expect(countCacheBreakpoints(after)).toBeLessThanOrEqual(4);
 		// The boundary breakpoint sits on the last stable block: with 2 OAuth
 		// identity blocks + 2 stable prompt blocks + 1 recall suffix, the
-		// anchor is index 3 — not the pre-decorated identity block (index 1)
-		// and not the volatile suffix at the tail (index 4).
+		// anchor is index 3. The pre-decorated identity block (index 1) loses
+		// its breakpoint so the head stays at tool + system and both rolling
+		// message breakpoints survive.
 		const systemAfter = textSystemBlocks(after);
 		const cachedSystem = systemAfter
 			.map((block, index) => ("cache_control" in block && block.cache_control != null ? index : -1))
 			.filter(index => index >= 0);
-		expect(cachedSystem).toContain(systemAfter.length - 2);
-		expect(cachedSystem).not.toContain(systemAfter.length - 1);
+		expect(cachedSystem).toEqual([systemAfter.length - 2]);
+		expect(findCachedMessageIndices(after)).toHaveLength(2);
 		expect(textSystemBlocks(before).length).toBe(systemAfter.length);
 		// Stable prefix bytes survive the recall refresh: strip the volatile
 		// suffix and the per-turn cache_control, then compare.
@@ -645,6 +705,55 @@ describe("anthropic head caching (general API-key path)", () => {
 				.filter(block => !block.text.startsWith("<memories>"))
 				.map(block => block.text);
 		expect(stableText(after)).toEqual(stableText(before));
+	});
+
+	it("anchors before the first volatile segment so blocks appended behind it stay out of the cached head", async () => {
+		// Coding-agent layout: static prompt, cwd-derived `<project-context>`,
+		// per-spawn subagent role text, then per-turn recall.
+		const capture = (cwd: string, role: string) =>
+			captureWireBody(undefined, {
+				...CONTEXT,
+				systemPrompt: [
+					"Static agent prompt.",
+					`<project-context>\n<file path="${cwd}/AGENTS.md">rules</file>\n</project-context>`,
+					role,
+					"<memories>\nrecall\n</memories>",
+				],
+			});
+		const first = textSystemBlocks(await capture("/work/a", "Role: spawn 1"));
+		const second = textSystemBlocks(await capture("/work/b", "Role: spawn 2"));
+		for (const system of [first, second]) {
+			expect(system.flatMap((block, index) => (block.cache_control != null ? [index] : []))).toEqual([0]);
+		}
+		expect(second[0]).toEqual(first[0]);
+	});
+
+	it("spends the OAuth system breakpoint on the last system block without taking one from the messages", async () => {
+		const oAuthModel = buildModel({ ...MODEL_SPEC, id: "claude-opus-5", name: "Claude Opus 5" });
+		const { body } = await captureTurn(
+			oAuthModel,
+			{
+				systemPrompt: ["You are helpful.", "Follow the house style."],
+				messages: [
+					{ role: "user", content: "hello", timestamp: 1 },
+					assistantMessage("hi there", 2),
+					{ role: "user", content: "again", timestamp: 3 },
+				],
+				tools: CONTEXT.tools,
+			},
+			"sess-oauth-anchor",
+		);
+		// 2 OAuth identity blocks + 2 caller prompt blocks. The only system
+		// breakpoint is on the last block, so a message-prefix miss still reads
+		// tools + the whole system prompt from cache.
+		const system = textSystemBlocks(body);
+		const cachedSystem = system
+			.map((block, index) => ("cache_control" in block && block.cache_control != null ? index : -1))
+			.filter(index => index >= 0);
+		expect(cachedSystem).toEqual([system.length - 1]);
+		// The move keeps the head at tool + system, so both rolling message
+		// breakpoints survive.
+		expect(findCachedMessageIndices(body)).toEqual([1, 2]);
 	});
 
 	it("falls back to tail anchoring when every system block is volatile", async () => {

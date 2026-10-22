@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { AsyncJobManager } from "../../src/async";
 import { Settings } from "../../src/config/settings";
-import subagentSystemPrompt from "../../src/prompts/system/subagent-system-prompt.md" with { type: "text" };
 import { AgentRegistry } from "../../src/registry/agent-registry";
 import { AgentLifecycleManager } from "../../src/registry/agent-lifecycle";
 import type { AgentSession } from "../../src/session/agent-session";
@@ -14,7 +13,6 @@ import type { AgentDefinition } from "../../src/task/types";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import { WorkPool, WorkPoolRegistry } from "../../src/task/workpool";
 import type { ToolSession } from "../../src/tools";
-import { prompt } from "@oh-my-pi/pi-utils";
 
 const AGENT: AgentDefinition = {
 	name: "scout",
@@ -28,6 +26,7 @@ const POLICY = {
 	agentName: "scout",
 	agent: AGENT,
 	effectiveAgent: AGENT,
+	structured: true,
 	schema: { schema: undefined, source: "none", mode: "permissive", outputSchemaOverridesAgent: false },
 	planMode: false,
 	isIsolated: false,
@@ -151,16 +150,6 @@ afterEach(async () => {
 });
 
 describe("WorkPool dispatch", () => {
-	it("renders the flat workpool yield contract after shared context", () => {
-		const rendered = prompt.render(subagentSystemPrompt, {
-			agent: "Worker",
-			context: "Shared context for every item.",
-			workPoolYieldItems: [{ id: "pool#1", index: 1 }],
-			outputSchema: { type: "object", properties: { "pool#1": {} } },
-		});
-		expect(rendered).toContain("{ key: <1-based number>, data: <outcome> }");
-		expect(rendered).not.toContain("Your terminal `yield` MUST use exactly this shape");
-	});
 	it("spawns while there is room, then queues round-robin, and dispatches to an idle agent", async () => {
 		const cards: CustomMessage[] = [];
 		const session = makeSession(cards);
@@ -222,6 +211,50 @@ describe("WorkPool dispatch", () => {
 		follow.resolve();
 		await finishPool(session, workpool);
 	});
+	it("marks only the submitted error item failed after a mixed-result batch", async () => {
+		const session = makeSession([], 1);
+		const first = Promise.withResolvers<void>();
+		vi.spyOn(structured, "runStructuredSubagent").mockImplementation(async request => {
+			await first.promise;
+			const id = request.identity?.id ?? "missing";
+			markIdle(id);
+			return execution(id);
+		});
+		vi.spyOn(executor, "runSubagentFollowUpTurn").mockImplementation(async options => {
+			markIdle(options.id);
+			return {
+				...singleResult(
+					options.id,
+					JSON.stringify({
+						"mixed#2": { error: "review unavailable" },
+						"mixed#3": { ok: true },
+					}),
+				),
+				extractedToolData: {
+					yield: [
+						{
+							status: "success",
+							type: ["mixed#2"],
+							error: "review unavailable",
+							data: { error: "review unavailable" },
+						},
+						{ status: "success", type: ["mixed#3"], data: { ok: true }, complete: true },
+					],
+				},
+			};
+		});
+		const workpool = pool(session, "mixed");
+		workpool.push(["warmup"]);
+		await until(() => workpool.agents[0]?.state === "running");
+		workpool.push(["failed review", "independent review"]);
+		await until(() => workpool.agents[0]?.queue.length === 2);
+		first.resolve();
+		await finishPool(session, workpool);
+		expect(workpool.batches[1]?.status).toBe("completed");
+		expect(workpool.items.map(item => item.status)).toEqual(["completed", "failed", "completed"]);
+		expect(workpool.batches[1]?.output).toContain("review unavailable");
+	});
+
 	it("tombstones the worker session when clearing the yield contract fails", async () => {
 		const session = makeSession([], 1);
 		let workerId = "";

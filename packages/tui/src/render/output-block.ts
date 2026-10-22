@@ -1,6 +1,9 @@
 /**
  * Bordered output container with optional header and sections.
  */
+import type { TspCardStatus, TspPreview, TspSpan, TspText, TspTone } from "@oh-my-pi/pi-wire";
+import { node, span } from "../native/describe";
+import type { NativeChild, NativeNode } from "../native/node";
 import { ImageProtocol, TERMINAL } from "../terminal-capabilities";
 import type { Theme, ThemeColor } from "../theme/theme";
 import type { Component } from "../tui";
@@ -14,6 +17,8 @@ import { getStateBgColor, Hasher, padToWidth } from "./utils";
 export interface OutputBlockOptions {
 	header?: string;
 	headerMeta?: string;
+	/** Facts drawn inside the bottom border (`╰── Wall 0.16s · Timeout 300s ──╯`). */
+	footerMeta?: string;
 	state?: State;
 	sections?: Array<{ label?: string; lines: readonly string[]; separator?: boolean }>;
 	width: number;
@@ -43,7 +48,7 @@ export function isFramedBlockComponent(component: Component): boolean {
 
 type BlockRow =
 	| { kind: "bar"; leftChar: string; rightChar: string; label?: string; meta?: string }
-	| { kind: "bottom"; leftChar: string; rightChar: string }
+	| { kind: "bottom"; leftChar: string; rightChar: string; meta?: string }
 	| { kind: "content"; inner: string }
 	| { kind: "sixel"; raw: string };
 
@@ -154,7 +159,26 @@ export function renderOutputBlock(options: OutputBlockOptions, theme: Theme): st
 		}
 	}
 
-	rows.push({ kind: "bottom", leftChar: theme.boxRound.bottomLeft, rightChar: theme.boxRound.bottomRight });
+	// Footer facts ride the bottom border only when they fit whole; a clipped
+	// border would silently drop trailing facts (exit code, artifact id), so an
+	// overflowing footer wraps into body rows above a plain border instead.
+	const footerMeta = options.footerMeta;
+	const footerFits =
+		footerMeta === undefined ||
+		visibleWidth(` ${footerMeta} `) <=
+			lineWidth - visibleWidth(`${theme.boxRound.bottomLeft}${cap}`) - visibleWidth(theme.boxRound.bottomRight);
+	if (footerMeta !== undefined && !footerFits) {
+		for (const wrappedLine of wrapTextWithAnsi(footerMeta, contentWidth)) {
+			const innerPadding = padding(Math.max(0, contentWidth - visibleWidth(wrappedLine)));
+			rows.push({ kind: "content", inner: `${wrappedLine}${innerPadding}` });
+		}
+	}
+	rows.push({
+		kind: "bottom",
+		leftChar: theme.boxRound.bottomLeft,
+		rightChar: theme.boxRound.bottomRight,
+		meta: footerFits ? footerMeta : undefined,
+	});
 
 	const H = rows.length;
 
@@ -179,14 +203,6 @@ export function renderOutputBlock(options: OutputBlockOptions, theme: Theme): st
 		return `${border(leftGlyphs)}${trimmedLabel}${border(fillGlyphs)}${border(rightGlyph)}`;
 	};
 
-	const renderBottom = (row: { leftChar: string; rightChar: string }): string => {
-		const leftGlyphs = `${row.leftChar}${cap}`;
-		const rightGlyph = row.rightChar;
-		const fillCount = Math.max(0, lineWidth - visibleWidth(leftGlyphs) - visibleWidth(rightGlyph));
-		const fillGlyphs = h.repeat(fillCount);
-		return `${border(leftGlyphs)}${border(fillGlyphs)}${border(rightGlyph)}`;
-	};
-
 	const renderContent = (inner: string): string =>
 		`${border(v)}${contentLeftPadding}${inner}${contentRightPadding}${border(v)}`;
 
@@ -198,12 +214,118 @@ export function renderOutputBlock(options: OutputBlockOptions, theme: Theme): st
 			lines.push(row.raw);
 			continue;
 		}
-		const line =
-			row.kind === "bar" ? renderBar(row) : row.kind === "bottom" ? renderBottom(row) : renderContent(row.inner);
+		const line = row.kind === "bar" || row.kind === "bottom" ? renderBar(row) : renderContent(row.inner);
 		lines.push(padToWidth(clipFrame ? truncateToWidth(line, lineWidth, Ellipsis.Omit) : line, lineWidth, bgFn));
 	}
 
 	return lines;
+}
+
+/** Card tone for an output state. */
+export function outputStateTone(state: State | undefined): TspTone {
+	switch (state) {
+		case "pending":
+		case "running":
+			return "pending";
+		case "success":
+			return "success";
+		case "error":
+			return "error";
+		case "warning":
+			return "warning";
+		default:
+			return "neutral";
+	}
+}
+
+/** Card status chip for an output state. */
+export function outputStateStatus(state: State | undefined): TspCardStatus | undefined {
+	switch (state) {
+		case "pending":
+			return "pending";
+		case "running":
+			return "running";
+		case "success":
+		case "warning":
+			return "done";
+		case "error":
+			return "error";
+		default:
+			return undefined;
+	}
+}
+
+/** One body section of a native output block. */
+export interface NativeOutputBlockSection {
+	/** Titled sub-section (the ANSI path's labelled separator bar). */
+	label?: TspText;
+	body: readonly NativeChild[];
+	/** Divide from the previous section with a rule. */
+	separator?: boolean;
+	/** Stable identity when sections come and go. */
+	key?: string;
+}
+
+/** Semantic inputs for {@link describeOutputBlock}. */
+export interface NativeOutputBlockOptions {
+	head?: TspText;
+	meta?: TspText;
+	state?: State;
+	/** Card role (`omp.tool.bash`, `omp.eval.cell`, …). Defaults to `omp.output`. */
+	role?: string;
+	/** Override the state-derived tone (the ANSI path's `borderColor`). */
+	tone?: TspTone;
+	sections?: readonly NativeOutputBlockSection[];
+	collapsible?: boolean;
+	collapsed?: boolean;
+	preview?: TspPreview;
+	/** Flat card without a ring (inline/plain variants). */
+	inset?: boolean;
+	key?: string;
+}
+
+function asSpans(content: TspText): readonly TspSpan[] {
+	return typeof content === "string" ? [span(content)] : content;
+}
+
+/**
+ * The native form of {@link renderOutputBlock}: a `card` whose tone and
+ * status chip come from the state, head from the header plus meta, and body
+ * from the sections (labelled ones as `section`s, separators as `rule`s).
+ * Borders, background fills and wrapping are the terminal's.
+ */
+export function describeOutputBlock(options: NativeOutputBlockOptions): NativeNode {
+	let head: TspText | undefined = options.head;
+	if (options.meta !== undefined && options.meta !== "") {
+		head = head === undefined ? options.meta : [...asSpans(head), span(" · ", "dim"), ...asSpans(options.meta)];
+	}
+	const children: NativeChild[] = [];
+	const sections = options.sections ?? [];
+	for (let index = 0; index < sections.length; index++) {
+		const section = sections[index]!;
+		const key = section.key ?? String(index);
+		if (section.label !== undefined) {
+			children.push(node("section", { head: section.label }, section.body, key));
+			continue;
+		}
+		if (section.separator && index > 0) children.push(node("rule", undefined, undefined, `${key}:rule`));
+		for (const child of section.body) children.push(child);
+	}
+	return node(
+		"card",
+		{
+			role: options.role ?? "omp.output",
+			tone: options.tone ?? outputStateTone(options.state),
+			status: outputStateStatus(options.state),
+			head,
+			collapsible: options.collapsible,
+			collapsed: options.collapsed,
+			preview: options.preview,
+			inset: options.inset,
+		},
+		children,
+		options.key,
+	);
 }
 
 /**
@@ -250,6 +372,7 @@ export class CachedOutputBlock {
 		);
 		h.optional(options.header);
 		h.optional(options.headerMeta);
+		h.optional(options.footerMeta);
 		h.optional(options.state);
 		h.optional(options.borderColor);
 		h.bool(options.applyBg ?? true);

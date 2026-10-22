@@ -2,9 +2,9 @@
 //!
 //! Collapses the git and Jujutsu CLI wrappers into one Rust interface:
 //! - **git** ([`git::GitRepo`]) runs primarily on gitoxide. The git binary
-//!   handles credential-bound network transfers, reftable repositories, and
+//!   handles credential-bound network transfers, reftable repositories,
 //!   whole-worktree status/untracked walks whose resource failures must stay
-//!   outside the driving process.
+//!   outside the driving process, and configured commit signing.
 //! - **jj** ([`jj::JjWorkspace`]) runs on jj-lib, which shares the same
 //!   gitoxide stack for its git backend. No subprocess at all.
 //!
@@ -343,6 +343,8 @@ mod tests {
 
 	use super::*;
 
+	// Diff oracles pass `--no-ext-diff`: a developer's `diff.external` (e.g.
+	// difftastic) would otherwise replace git's patch with its own output.
 	fn run_git(root: &Path, args: &[&str]) -> String {
 		let output = Command::new("git")
 			.current_dir(root)
@@ -420,7 +422,7 @@ mod tests {
 		fs::write(temp.path().join("staged.txt"), "staged\n").unwrap();
 		run_git(temp.path(), &["add", "staged.txt"]);
 
-		let expected = run_git(temp.path(), &["diff", "HEAD"]);
+		let expected = run_git(temp.path(), &["diff", "--no-ext-diff", "HEAD"]);
 		let actual = detect(temp.path())
 			.unwrap()
 			.unwrap()
@@ -482,8 +484,8 @@ mod tests {
 		fs::write(temp.path().join("new.txt"), "staged\nunstaged\n").unwrap();
 
 		let expected = git::join_patches(&[
-			run_git(temp.path(), &["diff"]),
-			run_git(temp.path(), &["diff", "--cached"]),
+			run_git(temp.path(), &["diff", "--no-ext-diff"]),
+			run_git(temp.path(), &["diff", "--no-ext-diff", "--cached"]),
 		]);
 		let actual = detect(temp.path())
 			.unwrap()

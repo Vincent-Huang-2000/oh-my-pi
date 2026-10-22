@@ -9,8 +9,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Ellipsis } from "@oh-my-pi/pi-natives";
+import { expandWindowsLongPath, getWindowsShortPath } from "@oh-my-pi/pi-natives/path";
 import { pluralize, sanitizeText } from "@oh-my-pi/pi-utils";
-import { formatKeyHints, type KeyId } from "../app-keybindings";
+import { formatKeyHint, type KeyId } from "../app-keybindings";
 import { getKeybindings } from "../keybindings";
 import type { Theme } from "../theme/theme";
 import type { Component } from "../tui";
@@ -201,10 +202,10 @@ const EXPAND_ACTION = "app.tools.expand";
 /** Fallback key when no binding is resolvable (e.g. outside an interactive session). */
 const DEFAULT_EXPAND_KEY: KeyId = "ctrl+o";
 
-/** Human-readable key currently bound to tool-output expansion, e.g. `Ctrl+O`. */
+/** Human-readable primary key bound to tool-output expansion, e.g. `Ctrl+O`. */
 export function expandKeyHint(): string {
-	const keys = getKeybindings().getKeys(EXPAND_ACTION);
-	return formatKeyHints(keys.length > 0 ? keys : [DEFAULT_EXPAND_KEY]);
+	const [key = DEFAULT_EXPAND_KEY] = getKeybindings().getKeys(EXPAND_ACTION);
+	return formatKeyHint(key);
 }
 
 // =============================================================================
@@ -232,15 +233,29 @@ export function getPreviewLines(text: string, maxLines: number, maxLineLen: numb
 	return lines.slice(0, maxLines).map(l => truncateToWidth(l.trim(), maxLineLen, ellipsis));
 }
 
+/** Collapse a possibly multi-line string into one line; whitespace runs (tabs included) become one space. */
+export function flattenLine(text: string): string {
+	return text.replace(/\s+/g, " ").trim();
+}
+
 /**
  * Collapse a possibly multi-line string into a single line, then truncate it to
  * `maxWidth` display cells. {@link truncateToWidth} alone caps width but
  * newlines are zero-width, so multi-line content (markdown briefs, tool args,
  * provider errors) would otherwise spill a single status row across several
- * visual lines. Whitespace runs collapse to one space, so tabs are handled too.
+ * visual lines.
  */
 export function previewLine(text: string, maxWidth: number, ellipsis?: Ellipsis): string {
-	return truncateToWidth(text.replace(/\s+/g, " ").trim(), maxWidth, ellipsis);
+	return truncateToWidth(flattenLine(text), maxWidth, ellipsis);
+}
+
+/**
+ * Clip a result row to `maxWidth` only while collapsed. Expanded rows stay whole
+ * so the frame wraps them: the expand key ({@link formatExpandHint}) must reveal
+ * text, not re-clip it.
+ */
+export function clipCollapsed(text: string, maxWidth: number, expanded: boolean | undefined): string {
+	return expanded ? text : truncateToWidth(text, maxWidth);
 }
 
 // =============================================================================
@@ -876,22 +891,51 @@ function defaultHomeDir(): string {
 	return cachedHomeDir;
 }
 
-const homePatternCache = new Map<string, RegExp>();
-function homePatternFor(homeDir: string, windowsStyle: boolean): RegExp {
+interface HomePattern {
+	leading: RegExp;
+	embedded: RegExp;
+}
+
+const homePatternCache = new Map<string, HomePattern>();
+function homePatternFor(homeDir: string, windowsStyle: boolean): HomePattern {
 	const key = `${windowsStyle ? 1 : 0} ${homeDir}`;
 	let pattern = homePatternCache.get(key);
 	if (pattern === undefined) {
-		const escapedHome = windowsStyle
-			? homeDir
-					.replaceAll("/", "\\")
-					.split("\\")
-					.map(part => RegExp.escape(part))
-					.join("[\\\\/]")
-			: RegExp.escape(homeDir);
-		pattern = new RegExp(
-			`[a-zA-Z][a-zA-Z0-9+.-]*://[^\\s"'<>]+|(^|[\\s"'\\x60([{=,:])(${escapedHome})(?=$|[\\\\/\\s"'\\x60)\\]},;:])`,
-			windowsStyle ? "gi" : "g",
-		);
+		// A trailing separator (`C:\Users\me\`, `/home/me/`) must still match `<home>/child`;
+		// roots such as `/` and `C:\` keep theirs.
+		const home = homeDir.replace(/(?<=[^\\/:])[\\/]+$/, "");
+		let escapedHome = RegExp.escape(home);
+		if (windowsStyle) {
+			// Query only home, once per cached pattern: descendants need not exist,
+			// and rendering must neither resolve junctions nor probe output paths.
+			const parts = home.replaceAll("/", "\\").split("\\");
+			const longHome = expandWindowsLongPath(home);
+			const aliases = [longHome, getWindowsShortPath(longHome)]
+				.map(alias => alias.replaceAll("/", "\\").split("\\"))
+				.filter(alias => alias.length === parts.length);
+			escapedHome = parts
+				.map((part, index) => {
+					// Each component may independently use its long or short spelling.
+					const names = [...new Set([part, ...aliases.map(alias => alias[index]!)])].map(name =>
+						RegExp.escape(name),
+					);
+					return names.length === 1 ? names[0]! : `(?:${names.join("|")})`;
+				})
+				.join("[\\\\/]");
+		}
+		// `*` and `_` are also identifier and glob characters (`/home/me_old`, `src/**/home/me/**`), so they
+		// bound the home directory only as Markdown emphasis: opened at start or after whitespace, and
+		// closed before end, whitespace, or punctuation.
+		const end = `[\\\\/\\s"'\\x60)\\]},;:<>&|]`;
+		pattern = {
+			leading: new RegExp(`^${escapedHome}(?=$|[\\\\/])`, windowsStyle ? "i" : ""),
+			embedded: new RegExp(
+				`[a-zA-Z][a-zA-Z0-9+.-]*://[^\\s"'<>]+` +
+					`|(^|[\\s"'\\x60([{=,:<>&|])(${escapedHome})(?=$|${end})` +
+					`|((?:^|\\s)[*_]{1,3})(${escapedHome})(?=$|${end}|[*_]{1,3}(?=$|[\\s.,;:!?)\\]}"'\\x60]))`,
+				windowsStyle ? "gi" : "g",
+			),
+		};
 		if (homePatternCache.size >= 16) homePatternCache.clear();
 		homePatternCache.set(key, pattern);
 	}
@@ -904,15 +948,12 @@ export function shortenPath(filePath: unknown, homeDir?: string): string {
 		return "";
 	}
 	const home = homeDir ?? defaultHomeDir();
+	if (!home) return filePath;
 	const windowsStyle = /^[A-Za-z]:[\\/]/.test(home) || home.startsWith("\\\\");
-	const hasHomePrefix = windowsStyle
-		? filePath.toLowerCase().startsWith(home.toLowerCase())
-		: filePath.startsWith(home);
-	if (home && hasHomePrefix) {
-		const suffix = filePath.slice(home.length);
-		if (suffix === "" || suffix.startsWith(path.posix.sep) || suffix.startsWith(path.win32.sep)) {
-			return `~${suffix.replaceAll(path.win32.sep, path.posix.sep)}`;
-		}
+	const match = homePatternFor(home, windowsStyle).leading.exec(filePath);
+	if (match) {
+		const suffix = filePath.slice(match[0].length);
+		return `~${suffix.replaceAll(path.win32.sep, path.posix.sep)}`;
 	}
 	return filePath;
 }
@@ -924,9 +965,14 @@ export function shortenEmbeddedPaths(text: string, homeDir?: string, preserveSep
 	const windowsStyle = /^[A-Za-z]:[\\/]/.test(resolvedHome) || resolvedHome.startsWith("\\\\");
 	const homePattern = homePatternFor(resolvedHome, windowsStyle);
 	const textWithShortenedHome = text.replace(
-		homePattern,
-		(match, boundary: string | undefined, candidate: string | undefined) =>
-			candidate === undefined ? match : `${boundary}~`,
+		homePattern.embedded,
+		(
+			match,
+			boundary: string | undefined,
+			candidate: string | undefined,
+			emphasis: string | undefined,
+			emphasized: string | undefined,
+		) => (candidate !== undefined ? `${boundary}~` : emphasized !== undefined ? `${emphasis}~` : match),
 	);
 	if (preserveSeparators) return textWithShortenedHome;
 	return textWithShortenedHome
@@ -943,6 +989,43 @@ export function shortenEmbeddedPaths(text: string, homeDir?: string, preserveSep
 			return `${leading}${normalized}${trailing}`;
 		})
 		.join(" ");
+}
+
+/**
+ * Shorten filesystem and command arguments without rewriting literal search patterns. A producer that
+ * names no argument key gets the general embedded-path shortening.
+ */
+export function shortenToolArgumentPaths(text: string, key: string | undefined, homeDir?: string): string {
+	if (key === "url") {
+		try {
+			const url = new URL(text);
+			if (url.protocol === "file:") {
+				let decodedPath = url.pathname;
+				try {
+					decodedPath = decodeURIComponent(decodedPath);
+				} catch {
+					/* Retain malformed percent escapes as literal path bytes. */
+				}
+				const filePath = url.hostname
+					? `//${url.hostname}${decodedPath}`
+					: /^[A-Za-z]:$/.test(decodedPath.slice(1, 3))
+						? decodedPath.slice(1)
+						: decodedPath;
+				return shortenEmbeddedPaths(filePath, homeDir);
+			}
+		} catch {
+			// Preserve malformed and non-file URL arguments verbatim.
+		}
+		return text;
+	}
+	return key === undefined ||
+		key === "path" ||
+		key === "file_path" ||
+		key === "command" ||
+		key === "task" ||
+		key === "prompt"
+		? shortenEmbeddedPaths(text, homeDir)
+		: text;
 }
 
 /** Sanitize warning text before showing it in TUI, including embedded home paths. */
@@ -973,8 +1056,12 @@ export function formatToolWorkingDirectory(workdir: string | undefined, projectD
 		return undefined;
 	}
 	const relativePath = path.relative(resolvedProjectDir, resolvedWorkdir);
+	// On Windows, `path.relative` across drives returns the absolute target, which is not inside the project.
 	const isWithinProject =
-		relativePath.length > 0 && !relativePath.startsWith("..") && !relativePath.startsWith(`..${path.sep}`);
+		relativePath.length > 0 &&
+		!path.isAbsolute(relativePath) &&
+		!relativePath.startsWith("..") &&
+		!relativePath.startsWith(`..${path.sep}`);
 	const displayWorkdir = isWithinProject ? relativePath : shortenPath(resolvedWorkdir);
 	return replaceTabs(displayWorkdir);
 }
@@ -1055,6 +1142,9 @@ export function createCachedComponent(
 		invalidate() {
 			cached = undefined;
 		},
+		releaseRenderCaches() {
+			cached = undefined;
+		},
 	};
 }
 
@@ -1085,6 +1175,14 @@ export function createRenderedStringCache(): RenderedStringCache {
 /** Drop the memo so the next lookup re-renders (e.g. the render function identity changed). */
 export function invalidateRenderedStringCache(cache: RenderedStringCache): void {
 	cache.theme = null;
+}
+
+export function releaseRenderedStringCache(cache: RenderedStringCache): void {
+	cache.theme = null;
+	cache.expanded = false;
+	cache.salt = "";
+	cache.content = "";
+	cache.value = "";
 }
 
 /** Reuse a rendered string while its theme, expansion, content, and salt match. */

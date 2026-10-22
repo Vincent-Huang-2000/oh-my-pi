@@ -162,7 +162,7 @@ async fn create_over_invalid_utf8_reports_already_exists() {
 #[tokio::test]
 async fn patch_create_overwrite_preserves_generated_file_guard() {
 	for (name, original) in [
-		("generated.ts", b"const value = 1;\n".as_slice()),
+		("schema.gen.ts", b"const value = 1;\n".as_slice()),
 		("source.ts", b"// @generated\nconst value = 1;\n".as_slice()),
 		("legacy.ts", b"// @generated\nname=caf\xe9\n".as_slice()),
 	] {
@@ -428,6 +428,7 @@ async fn hashline_rem_streaming_preview_does_not_error_on_invalid_utf8() {
 		allow_fuzzy:        true,
 		fuzzy_threshold:    0.95,
 		enforce_seen_lines: false,
+		max_columns:        512,
 		raw_input:          false,
 	};
 	let mut session = Session::new(config, EditStore::new());

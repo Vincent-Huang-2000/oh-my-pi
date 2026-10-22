@@ -1,9 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
-import { Agent, type AgentMessage, type AgentOptions, type AgentTool } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, FetchImpl, Model, ProviderSessionState, Usage } from "@oh-my-pi/pi-ai";
 import { streamGoogle } from "@oh-my-pi/pi-ai/providers/google";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
+import { streamOpenAIResponses } from "@oh-my-pi/pi-ai/providers/openai-responses";
+import type { ResponseInput, ResponseOutputItem } from "@oh-my-pi/pi-ai/providers/openai-responses-wire";
+import { createOpenAIResponsesHistoryPayload } from "@oh-my-pi/pi-ai/utils";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { AutoLearnController, buildAutoLearnInstructions } from "@oh-my-pi/pi-coding-agent/autolearn/controller";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -155,14 +158,6 @@ describe("AutoLearnController", () => {
 		expect(session.captures).toHaveLength(0);
 	});
 
-	it("does not nudge during plan mode", () => {
-		const session = new FakeSession();
-		session.planEnabled = true;
-		install(session, { "autolearn.autoContinue": true });
-		session.toolCalls(5);
-		session.agentEnd();
-		expect(session.captures).toHaveLength(0);
-	});
 	it("does not combine tool calls across separate sub-threshold turns", () => {
 		const session = new FakeSession();
 		install(session, { "autolearn.autoContinue": true });
@@ -345,6 +340,187 @@ describe("isolated auto-learn capture", () => {
 		};
 	}
 
+	const replayCases = [
+		{ api: "openai-responses", history: "native" },
+		{ api: "openrouter", history: "native" },
+		{ api: "openai-responses", history: "signature-only" },
+		{ api: "openai-responses", history: "cross-model" },
+	] as const;
+	for (const { api, history } of replayCases) {
+		it(`keeps inherited ${api} ${history} history stable after a capture tool round`, async () => {
+			const model = buildModel({
+				id: "gpt-5-mini",
+				name: "Capture test",
+				api,
+				provider: "capture-test",
+				baseUrl: "https://example.invalid/v1",
+				reasoning: true,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128_000,
+				maxTokens: 8_192,
+			});
+			const sourceReasoning = {
+				type: "reasoning" as const,
+				id: "rs_source",
+				encrypted_content: "enc_source",
+				summary: [],
+			};
+			const sourceAssistant: AssistantMessage = {
+				role: "assistant",
+				api,
+				provider: model.provider,
+				model: history === "cross-model" ? "other-model" : model.id,
+				content: [
+					{ type: "thinking", thinking: "Source reasoning", thinkingSignature: JSON.stringify(sourceReasoning) },
+					{
+						type: "text",
+						text: "Checking source",
+						textSignature: JSON.stringify({ v: 1, id: "msg_source", phase: "commentary" }),
+					},
+					{ type: "toolCall", id: "call_read|fc_source", name: "read", arguments: {} },
+				],
+				responseId: "response_source",
+				providerPayload:
+					history === "signature-only"
+						? undefined
+						: createOpenAIResponsesHistoryPayload(model.provider, [sourceReasoning]),
+				usage: ZERO_USAGE,
+				stopReason: "toolUse",
+				timestamp: 2,
+			};
+			const learnTool = captureTool("learn", "Record a lesson");
+			let learned = 0;
+			learnTool.execute = async () => {
+				learned++;
+				return { content: [{ type: "text", text: "Lesson recorded" }] };
+			};
+			const sourceAgent = new Agent({
+				initialState: {
+					model,
+					systemPrompt: ["Capture test system"],
+					tools: [captureTool("read", "Read source"), learnTool],
+					messages: [
+						{ role: "user", content: "Inspect source", timestamp: 1 },
+						sourceAssistant,
+						{
+							role: "toolResult",
+							toolCallId: "call_read|fc_source",
+							toolName: "read",
+							content: [{ type: "text", text: "Source inspected" }],
+							isError: false,
+							timestamp: 3,
+						},
+					],
+				},
+			});
+			const original = structuredClone(sourceAgent.state.messages);
+			const requests: Array<{
+				input: ResponseInput;
+				tools: unknown;
+				instructions: unknown;
+				prompt_cache_key: string;
+			}> = [];
+			const captureReasoning: ResponseOutputItem = {
+				...sourceReasoning,
+				id: "rs_capture",
+				encrypted_content: "enc_capture",
+			};
+			const fetchMock: FetchImpl = async (_input, init) => {
+				requests.push(JSON.parse(String(init?.body)));
+				const items: ResponseOutputItem[] =
+					requests.length === 1
+						? [
+								captureReasoning,
+								{
+									type: "function_call",
+									id: "fc_learn",
+									call_id: "call_learn",
+									name: "learn",
+									arguments: "{}",
+								},
+							]
+						: [
+								{
+									type: "message",
+									id: "msg_capture",
+									role: "assistant",
+									status: "completed",
+									content: [{ type: "output_text", text: "Captured", annotations: [] }],
+								},
+							];
+				const events = [
+					{ type: "response.created", response: { id: `response_capture_${requests.length}` } },
+					...items.flatMap((item, output_index) => [
+						{ type: "response.output_item.added", output_index, item },
+						{ type: "response.output_item.done", output_index, item },
+					]),
+					{
+						type: "response.completed",
+						response: { id: `response_capture_${requests.length}`, status: "completed", output: items },
+					},
+				];
+				return new Response(`${events.map(event => `data: ${JSON.stringify(event)}`).join("\n\n")}\n\n`, {
+					headers: { "content-type": "text/event-stream" },
+				});
+			};
+			Object.assign(fetchMock, { preconnect: fetch.preconnect });
+			const runCapture = createAutoLearnCaptureRunner({
+				sourceAgent,
+				captureTools: () => [learnTool, captureTool("manage_skill", "Manage skills")],
+				createAgent: options =>
+					new Agent({
+						...options,
+						convertToLlm,
+						streamFn: (_model, context, streamOptions) =>
+							streamOpenAIResponses(model as Model<"openai-responses">, context, {
+								...streamOptions,
+								apiKey: "test-key",
+								fetch: fetchMock,
+								statefulResponses: false,
+							}),
+					}),
+			});
+			const previousOpenRouterResponses = Bun.env.PI_OPENROUTER_RESPONSES;
+			if (api === "openrouter") Bun.env.PI_OPENROUTER_RESPONSES = "1";
+			try {
+				await runCapture("Record the lesson");
+			} finally {
+				if (api === "openrouter") {
+					if (previousOpenRouterResponses === undefined) {
+						delete Bun.env.PI_OPENROUTER_RESPONSES;
+					} else {
+						Bun.env.PI_OPENROUTER_RESPONSES = previousOpenRouterResponses;
+					}
+				}
+			}
+			expect(requests).toHaveLength(2);
+			const [first, second] = requests;
+			expect(second.input.slice(0, first.input.length)).toEqual(first.input);
+			expect(second.tools).toEqual(first.tools);
+			expect(second.instructions).toEqual(first.instructions);
+			expect(second.prompt_cache_key).toBe(first.prompt_cache_key);
+			expect(JSON.stringify(second.input)).not.toContain("enc_source");
+			expect(second.input.slice(first.input.length)).toContainEqual(
+				expect.objectContaining({
+					type: "reasoning",
+					encrypted_content: "enc_capture",
+					summary: [],
+				}),
+			);
+			expect(second.input).toContainEqual({
+				type: "function_call_output",
+				call_id: "call_learn",
+				output: "Lesson recorded",
+			});
+			if (history !== "cross-model") {
+				expect(first.input).toContainEqual(expect.objectContaining({ role: "assistant", phase: "commentary" }));
+			}
+			expect(learned).toBe(1);
+			expect(sourceAgent.state.messages).toEqual(original);
+		});
+	}
+
 	it("uses constrained tools and sends full Google context without the primary anchor", async () => {
 		const model = googleInteractionsModel();
 		const manageSkillTool = captureTool("manage_skill", "Manage reusable skills");
@@ -422,67 +598,6 @@ describe("isolated auto-learn capture", () => {
 		expect(sourceAssistant?.responseId).toBe("primary-interaction");
 		expect(sourceAgent.peekSteeringQueue()).toEqual([queuedUserMessage]);
 		expect(primaryEvents).toBe(0);
-	});
-
-	it("forwards provider lifecycle hooks to the detached capture", async () => {
-		const captureMock = createMockModel({ responses: [{ content: ["Captured."] }] });
-		const manageSkillTool = captureTool("manage_skill", "Manage reusable skills");
-		const sourceAgent = new Agent({
-			initialState: { model: captureMock, systemPrompt: ["Test"], tools: [manageSkillTool] },
-		});
-		const onPayload: NonNullable<AgentOptions["onPayload"]> = async payload => payload;
-		const onResponse: NonNullable<AgentOptions["onResponse"]> = async () => {};
-		let captureOnPayload: AgentOptions["onPayload"];
-		let captureOnResponse: AgentOptions["onResponse"];
-		const runCapture = createAutoLearnCaptureRunner({
-			sourceAgent,
-			captureTools: () => [manageSkillTool],
-			onPayload,
-			onResponse,
-			createAgent: options => {
-				captureOnPayload = options.onPayload;
-				captureOnResponse = options.onResponse;
-				return new Agent({
-					...options,
-					convertToLlm,
-					streamFn: captureMock.stream,
-				});
-			},
-		});
-
-		await runCapture("Capture with provider hooks");
-
-		expect(captureMock.calls).toHaveLength(1);
-		expect(captureOnPayload).toBe(onPayload);
-		expect(captureOnResponse).toBe(onResponse);
-	});
-
-	it("adds learn alongside manage_skill when a memory backend provides it", async () => {
-		const model = googleInteractionsModel();
-		const manageSkillTool = captureTool("manage_skill", "Manage reusable skills");
-		const learnTool = captureTool("learn", "Store long-term memory");
-		const sourceAgent = new Agent({
-			initialState: { model, systemPrompt: ["Test"], tools: [manageSkillTool, learnTool] },
-		});
-		const captureMock = createMockModel({ responses: [{ content: ["Captured."] }] });
-		let captureToolNames: string[] = [];
-		const runCapture = createAutoLearnCaptureRunner({
-			sourceAgent,
-			captureTools: () => [manageSkillTool, learnTool],
-			createAgent: options => {
-				captureToolNames = options.initialState?.tools?.map(tool => tool.name) ?? [];
-				return new Agent({
-					...options,
-					convertToLlm,
-					streamFn: captureMock.stream,
-				});
-			},
-		});
-
-		await runCapture("Capture reusable knowledge");
-
-		expect(captureToolNames).toEqual(["manage_skill", "learn"]);
-		expect(captureMock.calls).toHaveLength(1);
 	});
 
 	it("keeps source credentials and account metadata while using a fresh transport session", async () => {

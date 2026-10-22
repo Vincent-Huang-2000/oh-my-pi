@@ -14,9 +14,9 @@ import {
 	type AgentHistorySummary,
 	type AgentMetricsSummary,
 	type AgentRegistry,
-	getAgentTombstonePath,
 	MAIN_AGENT_ID,
 } from "./agent-registry";
+import { getAgentTombstonePath } from "./agent-tombstone";
 
 /** Maximum prefix entries inspected for task metadata. */
 const MAX_METADATA_LINES = 64;
@@ -151,8 +151,12 @@ async function readPersistedAgentHistory(
 	const parents = new Map<string, string | undefined>();
 	const assistantById = new Map<string, AssistantMetrics>();
 	const modelChangeById = new Map<string, { model: string; role?: string; resolvedModelIsFallback: boolean }>();
+	// Raw-record copy of `sessionEntryLeafId`/`resolveSessionLeafId` (session-entries.ts); keep them in sync.
 	let leafId: string | undefined;
+	let selfSelectedLeafId: string | undefined;
 	let leafTimestamp: number | undefined;
+	let directCost = 0;
+	// Direct cost mirrors lifetime SessionManager usage; legacy metrics below stay leaf-scoped.
 	try {
 		await visitEntriesFromFileStream(
 			transcript.sessionFile,
@@ -163,9 +167,25 @@ async function readPersistedAgentHistory(
 				if (!id) return;
 				const parentId = typeof record.parentId === "string" ? record.parentId : undefined;
 				parents.set(id, parentId);
-				leafId = id;
+				// Same replay rule as `sessionEntryLeafId`: an entry written off the active
+				// branch (late usage, a routed bash result) restores the leaf it captured
+				// instead of becoming the leaf itself.
+				if (typeof record.activeLeafId === "string") {
+					leafId = record.activeLeafId;
+				} else if (record.activeLeafId === null) {
+					leafId = undefined;
+				} else {
+					leafId = id;
+					selfSelectedLeafId = id;
+				}
 				const parsedTimestamp = timestampOf(record.timestamp);
 				if (parsedTimestamp !== undefined) leafTimestamp = parsedTimestamp;
+				if (record.type === "model_usage") {
+					const usage = recordOf(record.usage);
+					const cost = recordOf(usage?.cost);
+					directCost += finiteNumber(cost?.total);
+					return;
+				}
 				if (record.type === "model_change" && typeof record.model === "string") {
 					modelChangeById.set(id, {
 						model: record.model,
@@ -176,7 +196,11 @@ async function readPersistedAgentHistory(
 				}
 				if (record.type !== "message") return;
 				const message = recordOf(record.message);
-				if (message?.role === "assistant") assistantById.set(id, assistantMetrics(message));
+				if (message?.role === "assistant") {
+					const assistant = assistantMetrics(message);
+					assistantById.set(id, assistant);
+					directCost += assistant.cost;
+				}
 			},
 			// Advisor transcripts are the one file that can grow pathologically large
 			// (issue #9553); cap their scan so one bad transcript can't stall the Hub
@@ -199,6 +223,7 @@ async function readPersistedAgentHistory(
 		return {};
 	}
 
+	if (leafId !== undefined && !parents.has(leafId)) leafId = selfSelectedLeafId;
 	const metrics: AgentMetricsSummary = {
 		tokens: 0,
 		requests: 0,
@@ -264,6 +289,7 @@ async function readPersistedAgentHistory(
 	}
 	if (contextTokens !== undefined) metrics.contextTokens = contextTokens;
 	return {
+		directCost,
 		...(metrics.requests > 0 ? { metrics } : {}),
 		...(resolvedModel ? { resolvedModel, resolvedModelIsFallback } : {}),
 		...(modelRole ? { modelRole } : {}),
@@ -341,7 +367,10 @@ async function readPersistedAgentMetadata(
 				hasSessionInit = true;
 				createdAt ??= timestampOf(record.timestamp);
 				if (typeof record.task === "string") activity = summarizePersistedTask(record.task);
-				const inferred = typeof record.systemPrompt === "string" ? inferBundledAgent(record.systemPrompt) : {};
+				const systemPrompt = Array.isArray(record.systemPrompt)
+					? record.systemPrompt.join("\n\n")
+					: record.systemPrompt;
+				const inferred = typeof systemPrompt === "string" ? inferBundledAgent(systemPrompt) : {};
 				history = {
 					...history,
 					...inferred,
@@ -484,7 +513,8 @@ function rosterScanError(error: unknown): string {
 	return text.length <= 200 ? text : `${text.slice(0, 197)}...`;
 }
 
-function sessionFileBelongsToRoot(sessionFile: string, rootSessionFile: string): boolean {
+/** Whether `sessionFile` is the root transcript or lives in its artifacts tree. */
+export function sessionFileBelongsToRoot(sessionFile: string, rootSessionFile: string): boolean {
 	const file = path.resolve(sessionFile);
 	const root = path.resolve(rootSessionFile);
 	const artifactRoot = root.slice(0, -".jsonl".length);

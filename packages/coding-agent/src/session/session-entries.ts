@@ -9,6 +9,9 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import type { StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
 import type { CompactionMethod } from "./compaction-methods";
+import type { WorkPoolYieldItem } from "../task/workpool-yield";
+import type { RetryFallbackRole } from "./retry-fallback-chains";
+import type { RuntimeIdentity } from "./runtime-identity";
 
 export const CURRENT_SESSION_VERSION = 3;
 
@@ -49,14 +52,22 @@ export interface SessionHeader {
 	parentSession?: string;
 	/** Prior absolute JSONL locations recorded by successful session moves. */
 	previousSessionFiles?: string[];
-	/** Provider prompt-cache identity inherited by exact-route full forks. */
+	/** Local-only provider prompt-cache identity inherited by exact-route full forks; omitted from shares and HTML. */
 	providerPromptCacheKey?: string;
+	/** Local-only Task candidate, gated by the actual request model's cache policy; omitted from shares and HTML. */
+	taskPromptCacheKey?: string;
+	/**
+	 * Source session file of a read-only seance fork. Its artifacts stay in the
+	 * source: `history://`, `artifact://`, and `agent://` read them from there.
+	 */
+	seanceSource?: string;
 }
 
 export interface NewSessionOptions {
 	parentSession?: string;
 	/** Provider prompt-cache identity to seed on the new session header. */
 	providerPromptCacheKey?: string;
+	taskPromptCacheKey?: string;
 	/** Skip flushing the current session and delete it instead of saving. */
 	drop?: boolean;
 	/** Additional workspace directories to seed on the new session. */
@@ -70,6 +81,19 @@ export interface SessionEntryBase {
 	id: string;
 	parentId: string | null;
 	timestamp: string;
+	/**
+	 * omp build that wrote this entry, set on every entry this session's process authors. Copies
+	 * (forks, branches, collab replicas) keep the original writer. Absent on older entries.
+	 */
+	runtime?: RuntimeIdentity;
+	/**
+	 * Active leaf at append time, for an entry written off the active branch (late usage,
+	 * a background bash result routed back to the branch it started on). The loader replays
+	 * it instead of treating this entry as the leaf, so resume keeps the branch the live
+	 * session was on. Absence keeps the ordinary last-entry semantics; null records a
+	 * cleared leaf.
+	 */
+	activeLeafId?: string | null;
 }
 
 export interface SessionMessageEntry extends SessionEntryBase {
@@ -233,8 +257,8 @@ export interface CredentialPinEntry extends SessionEntryBase {
 /** Session init entry - captures initial context for subagent sessions (debugging/replay). */
 export interface SessionInitEntry extends SessionEntryBase {
 	type: "session_init";
-	/** Full system prompt sent to the model */
-	systemPrompt: string;
+	/** System prompt blocks exactly as sent to the model; files written before blocks were kept store one joined string. */
+	systemPrompt: string[] | string;
 	/** Initial task/user message */
 	task: string;
 	/** Tools available to the agent */
@@ -245,6 +269,8 @@ export interface SessionInitEntry extends SessionEntryBase {
 	modelRole?: string;
 	/** Initially resolved provider/model selector for historical display. */
 	resolvedModel?: string;
+	/** Subagent's `subagent:<id>` retry fallback role as installed at spawn; cold revival reinstalls it. Absent when none was installed or on older files. */
+	retryFallback?: RetryFallbackRole;
 	/** Whether the agent definition is read-only, allowing an exact zero-LoC attribution. */
 	readOnly?: boolean;
 	/** Output schema if structured output was requested. */
@@ -263,6 +289,8 @@ export interface SessionInitEntry extends SessionEntryBase {
 	compactionThreshold?: { thresholdPercent: number; thresholdTokens: number };
 	/** True when the subagent ran inside an isolation worktree: never revivable, transcript-only after park. Absent on older files. */
 	isolated?: boolean;
+	/** Work-pool yield items of the last model call; revival restores them so the yield tool matches. Absent when none. */
+	workPoolYieldItems?: WorkPoolYieldItem[];
 }
 
 /** Mode change entry - tracks agent mode transitions (e.g. plan mode). */
@@ -315,6 +343,32 @@ export type SessionEntry =
 	| CredentialPinEntry
 	| ResetBoundaryEntry;
 
+/** Leaf selected when replaying one entry; an off-branch entry restores the active leaf captured at append time. */
+export function sessionEntryLeafId(entry: SessionEntry): string | null {
+	return entry.activeLeafId !== undefined ? entry.activeLeafId : entry.id;
+}
+
+/** Newest entry that selects itself on replay; skips late-usage markers. */
+export function lastSelfSelectedLeafId(entries: readonly SessionEntry[]): string | null {
+	for (let index = entries.length - 1; index >= 0; index--) {
+		const entry = entries[index];
+		if (sessionEntryLeafId(entry) === entry.id) return entry.id;
+	}
+	return null;
+}
+
+/**
+ * Active leaf after replaying entries in file order; an empty or cleared session has no leaf.
+ * A captured leaf that no longer exists (rollback, rewrite) falls back to the newest self-selecting entry.
+ */
+export function resolveSessionLeafId(entries: readonly SessionEntry[]): string | null {
+	const last = entries.at(-1);
+	if (!last) return null;
+	const leafId = sessionEntryLeafId(last);
+	if (leafId === null || leafId === last.id || entries.some(entry => entry.id === leafId)) return leafId;
+	return lastSelfSelectedLeafId(entries);
+}
+
 /** Raw logical file entry after loaders strip any fixed-width title slot. */
 export type FileEntry = SessionHeader | SessionEntry;
 
@@ -340,6 +394,8 @@ export interface UsageStatistics {
 	orchestrationCacheRead: number;
 	premiumRequests: number;
 	cost: number;
+	/** Portion of {@link cost} carried by completed `task` results (direct children's spend). */
+	subagentCost: number;
 }
 /**
  * True when a raw JSONL line is a complete `message` record carrying an

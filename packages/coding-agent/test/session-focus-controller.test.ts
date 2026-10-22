@@ -90,7 +90,7 @@ function makeHarness(options: { renderInitialMessages?: () => void | Promise<voi
 		},
 		pendingMessagesContainer,
 		compactionQueuedMessages: [],
-		keybindings: { getDisplayString: () => "Alt+Up" },
+		keybindings: { getKeys: () => ["alt+up"] },
 		unsubscribe: () => {
 			mainUnsubscribe++;
 		},
@@ -102,6 +102,7 @@ function makeHarness(options: { renderInitialMessages?: () => void | Promise<voi
 				resetTranscriptAnchors++;
 			},
 			restorePendingToolResults() {},
+			markViewIdle() {},
 		},
 		statusLine: {
 			setSession: (session: AgentSession, focusedAgentId?: string) => {
