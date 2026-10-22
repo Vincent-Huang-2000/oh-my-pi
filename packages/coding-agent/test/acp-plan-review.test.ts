@@ -685,6 +685,45 @@ describe("ACP plan review", () => {
 		}
 	});
 
+	it("closing during fresh-session creation cannot register a replacement or dispatch execution", async () => {
+		const replacing = Promise.withResolvers<void>();
+		const releaseReplacement = Promise.withResolvers<void>();
+		const harness = await createHarness({
+			elicitationHandler: async () => ({ action: "accept", content: { decision: "refine" } }),
+		});
+		try {
+			const { created, session } = await createPlanSession(harness);
+			await session.planProposalHandler!("words-counter");
+			const reviewId = reviewUpdates(harness.updates).find(update => update.review)?.review?.reviewId;
+			session.newSession = async () => {
+				replacing.resolve();
+				await releaseReplacement.promise;
+				session.sessionId = crypto.randomUUID();
+				return true;
+			};
+			const action = harness.agent.extMethod("omp.planReview/action", {
+				sessionId: created.sessionId,
+				reviewId,
+				decision: "execute",
+			});
+			await replacing.promise;
+			await harness.agent.closeSession({ sessionId: created.sessionId });
+			releaseReplacement.resolve();
+			expect(await action).toMatchObject({ ok: false });
+			expect(harness.updates.some(update => update.update._meta?.["omp.sessionReplacement"])).toBe(false);
+			expect(session.promptCalls).toEqual([]);
+			await expect(
+				harness.agent.prompt({
+					sessionId: session.sessionId,
+					prompt: [{ type: "text", text: "continue" }],
+				}),
+			).rejects.toThrow();
+		} finally {
+			releaseReplacement.resolve();
+			await harness.agent.dispose();
+		}
+	});
+
 	it.each(["execute", "compact", "keep", "save"])(
 		"completes deferred %s inside the owning prompt at the allowed context boundary",
 		async decision => {

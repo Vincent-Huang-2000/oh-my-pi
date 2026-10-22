@@ -2925,6 +2925,7 @@ export class AcpAgent implements Agent {
 		const previousSessionId = session.sessionId;
 		const record = this.#getSessionRecord(previousSessionId);
 		if (!(await session.newSession())) return false;
+		this.#throwIfRecordClosed(record);
 		this.#sessions.delete(previousSessionId);
 		this.#sessions.set(session.sessionId, record);
 		session.setClientBridge(createAcpClientBridge(this.#connection, session.sessionId, this.#clientCapabilities));
