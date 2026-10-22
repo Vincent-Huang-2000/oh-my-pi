@@ -1424,6 +1424,7 @@ export class AcpAgent implements Agent {
 		if (promptTurn.cleanup) {
 			return promptTurn.cleanup;
 		}
+		record.pendingPlanOutcome = undefined;
 		promptTurn.cancelRequested = true;
 		promptTurn.abortController.abort();
 		promptTurn.unsubscribe?.();
@@ -1954,6 +1955,7 @@ export class AcpAgent implements Agent {
 			await this.#flushUnreportedTurnError(record, event);
 			await this.#emitEndOfTurnUpdates(record);
 			await this.#waitForAcpPromptIdle(record);
+			if (record.promptTurn !== promptTurn || promptTurn.abortController.signal.aborted) return;
 			// A deferred plan-review outcome (fresh session, compaction, model
 			// switch, save-and-quit) runs here: the turn has settled, the
 			// session is idle, and the prompt-turn subscription is still alive
@@ -1962,15 +1964,22 @@ export class AcpAgent implements Agent {
 			record.pendingPlanOutcome = undefined;
 			if (pendingOutcome) {
 				try {
-					const error = await this.#executePlanReviewOutcome(record.session, pendingOutcome);
+					const error = await this.#executePlanReviewOutcome(
+						record.session,
+						pendingOutcome,
+						promptTurn.abortController.signal,
+					);
 					if (error) {
 						await this.#emitPlanReviewClosed(record.session);
 						await this.#emitCommandOutput(record, error);
 					}
 				} catch (error) {
-					logger.warn("ACP plan review outcome failed", { sessionId: record.session.sessionId, error });
+					if (!promptTurn.abortController.signal.aborted) {
+						logger.warn("ACP plan review outcome failed", { sessionId: record.session.sessionId, error });
+					}
 				}
 			}
+			if (record.promptTurn !== promptTurn || promptTurn.abortController.signal.aborted) return;
 			record.liveMessageId = undefined;
 			record.liveMessageProgress = undefined;
 			this.#finishPrompt(record, {
@@ -2428,6 +2437,7 @@ export class AcpAgent implements Agent {
 	 */
 	async #handleAcpPlanProposal(session: AgentSession, title: string): Promise<AgentToolResult<unknown>> {
 		const record = this.#getSessionRecord(session.sessionId);
+		const signal = record.promptTurn?.abortController.signal;
 		const state = session.getPlanModeState();
 		if (!state?.enabled) {
 			throw new ToolError("Plan mode is not active.");
@@ -2444,6 +2454,7 @@ export class AcpAgent implements Agent {
 		});
 		const reviewId = crypto.randomUUID();
 		await this.#withPlanReviewMutation(record, async () => {
+			signal?.throwIfAborted();
 			if (session.getPlanModeState() !== state)
 				throw new ToolError("Plan mode changed while resolving the proposal.");
 			// Promote the reviewed path into plan-mode state so the next
@@ -2487,6 +2498,7 @@ export class AcpAgent implements Agent {
 			planContent,
 			planReviewOptions(session.getContextUsage()),
 			this.#buildExecutionModelOptions(session),
+			signal,
 		);
 		// 等待用户期间模式或审核可能已变化；在同一串行边界内验证并落盘。
 		const resolution = await this.#withPlanReviewMutation<AgentToolResult<unknown> | PlanReviewOutcome>(
@@ -2499,7 +2511,9 @@ export class AcpAgent implements Agent {
 						details,
 					};
 				}
-				const decision = validatePlanReviewDecision(requestedDecision, session.getContextUsage());
+				const decision = signal?.aborted
+					? undefined
+					: validatePlanReviewDecision(requestedDecision, session.getContextUsage());
 				const normalizedTitle = normalizePlanTitle(resolvedTitle).title;
 				if (!decision || decision.kind === "cancel") {
 					// Dismissal keeps plan mode active for another planning turn —
@@ -2624,7 +2638,7 @@ export class AcpAgent implements Agent {
 		);
 		if (!("kind" in resolution)) return resolution;
 		const outcome = resolution;
-		const error = await this.#executePlanReviewOutcome(session, outcome);
+		const error = await this.#executePlanReviewOutcome(session, outcome, signal);
 		if (error) {
 			await this.#emitPlanReviewClosed(session);
 			return { content: [{ type: "text", text: error }], details };
@@ -2655,6 +2669,7 @@ export class AcpAgent implements Agent {
 		planContent: string,
 		options: PlanReviewOption[],
 		executionModels: PlanReviewExecutionModel[] | undefined,
+		signal: AbortSignal | undefined,
 	): Promise<AcpPlanReviewDecision | undefined> {
 		const supportsForm = this.#clientCapabilities?.elicitation?.form != null;
 		if (!supportsForm) return { kind: "approve", strategy: "keep" };
@@ -2703,7 +2718,7 @@ export class AcpAgent implements Agent {
 			message,
 			properties,
 			undefined,
-			undefined,
+			{ signal },
 		);
 		return parsePlanReviewAction(content);
 	}
@@ -2941,9 +2956,15 @@ export class AcpAgent implements Agent {
 	 * feedback as a user prompt; cancel just closes the review. Outcomes
 	 * whose review was superseded (newer proposal, mode exit) are skipped.
 	 */
-	async #executePlanReviewOutcome(session: AgentSession, outcome: PlanReviewOutcome): Promise<string | undefined> {
+	async #executePlanReviewOutcome(
+		session: AgentSession,
+		outcome: PlanReviewOutcome,
+		signal?: AbortSignal,
+	): Promise<string | undefined> {
 		await session.waitForIdle();
+		signal?.throwIfAborted();
 		const state = await this.#readPlanReviewState(session);
+		signal?.throwIfAborted();
 		if (!state || state.reviewId !== outcome.reviewId) {
 			return;
 		}
@@ -2968,6 +2989,7 @@ export class AcpAgent implements Agent {
 				feedback: outcome.feedback,
 			});
 			await this.#emitPlanReviewClosed(session);
+			signal?.throwIfAborted();
 			const feedback = outcome.feedback.trim() || "Refine the plan.";
 			await this.#dispatchSessionPrompt(session, feedback);
 			return;
@@ -2981,14 +3003,17 @@ export class AcpAgent implements Agent {
 			await this.#exitPlanModeForApproval(session);
 			await this.#deletePlanReviewState(session);
 			await this.#emitPlanReviewClosed(session);
+			signal?.throwIfAborted();
 			await this.#replacePlanReviewSession(session);
 			return;
 		}
 		const content = outcome.editedContent ?? outcome.content;
 		await this.#autosaveApprovedPlan(session, outcome.title, content);
+		signal?.throwIfAborted();
 		await this.#exitPlanModeForApproval(session);
 		await this.#deletePlanReviewState(session);
 		await this.#emitPlanReviewClosed(session);
+		signal?.throwIfAborted();
 		session.setPlanReferencePath(outcome.planFilePath);
 		if (outcome.strategy === "execute") {
 			// Fresh session: snapshot the local root, start a new session, copy
@@ -3026,7 +3051,9 @@ export class AcpAgent implements Agent {
 				}
 			}
 		}
+		signal?.throwIfAborted();
 		await this.#applyExecutionModelChoice(session, outcome.executionModel);
+		signal?.throwIfAborted();
 		session.markPlanReferenceSent();
 		const execPrompt = prompt.render(planModeApprovedPrompt, {
 			planFilePath: outcome.planFilePath,
@@ -3035,6 +3062,7 @@ export class AcpAgent implements Agent {
 		});
 		await this.#dispatchSessionPrompt(session, execPrompt);
 		await session.waitForIdle();
+		signal?.throwIfAborted();
 	}
 
 	/** Run a review decision submitted through the `omp.planReview/action`
@@ -3062,9 +3090,17 @@ export class AcpAgent implements Agent {
 				this.#trackPromptEvent(record, event);
 			});
 			try {
-				actionError = await this.#executePlanReviewOutcome(record.session, outcome);
+				actionError = await this.#executePlanReviewOutcome(
+					record.session,
+					outcome,
+					promptTurn.abortController.signal,
+				);
 				await record.session.waitForIdle();
 				await this.#waitForPromptEventHandlers(record);
+				promptTurn.abortController.signal.throwIfAborted();
+			} catch (error) {
+				if (!promptTurn.abortController.signal.aborted) throw error;
+				actionError = "Plan review action was cancelled.";
 			} finally {
 				this.#finishPrompt(record, { stopReason: "end_turn" });
 			}

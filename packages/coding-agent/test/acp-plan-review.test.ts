@@ -542,6 +542,123 @@ describe("ACP plan review", () => {
 		}
 	});
 
+	it("cancellation while agent_end waits for idle discards deferred approval without consuming the review", async () => {
+		const waiting = Promise.withResolvers<void>();
+		const releaseIdle = Promise.withResolvers<void>();
+		const drained = Promise.withResolvers<void>();
+		const harness = await createHarness({
+			elicitationHandler: async () => ({ action: "accept", content: { decision: "execute" } }),
+		});
+		try {
+			const { created, session } = await createPlanSession(harness);
+			session.waitForIdle = async () => {
+				waiting.resolve();
+				await releaseIdle.promise;
+			};
+			session.drainAsyncJobDeliveriesForAcp = async () => {
+				drained.resolve();
+				return false;
+			};
+			session.prompt = async () => {
+				session.isStreaming = true;
+				await session.planProposalHandler!("words-counter");
+				session.emit({ type: "agent_end", messages: [] });
+				return true;
+			};
+			const running = harness.agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "plan" }],
+			});
+			await waiting.promise;
+			await harness.agent.cancel({ sessionId: created.sessionId });
+			releaseIdle.resolve();
+			await drained.promise;
+			expect((await running).stopReason).toBe("cancelled");
+			// Reopen reads the persisted state after the old event handler resumes.
+			expect((await harness.agent.extMethod("omp.planReview/reopen", { sessionId: created.sessionId })).ok).toBe(
+				true,
+			);
+			expect(session.sessionId).toBe(created.sessionId);
+			expect(session.planModeState?.enabled).toBe(true);
+			expect(session.planReferenceSent).toBe(false);
+		} finally {
+			releaseIdle.resolve();
+			await harness.agent.dispose();
+		}
+	});
+
+	it("cancels a pending review without waiting for the client and ignores late approval", async () => {
+		const opened = Promise.withResolvers<void>();
+		const response = Promise.withResolvers<CreateElicitationResponse>();
+		const proposalFinished = Promise.withResolvers<void>();
+		const harness = await createHarness({
+			elicitationHandler: async () => {
+				opened.resolve();
+				return response.promise;
+			},
+		});
+		try {
+			const { created, session } = await createPlanSession(harness);
+			session.prompt = async () => {
+				session.isStreaming = true;
+				await session.planProposalHandler!("words-counter");
+				proposalFinished.resolve();
+				return true;
+			};
+			const running = harness.agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "plan" }],
+			});
+			await opened.promise;
+			await harness.agent.cancel({ sessionId: created.sessionId });
+			expect((await running).stopReason).toBe("cancelled");
+			const finishedBeforeResponse = await Promise.race([
+				proposalFinished.promise.then(() => true),
+				Bun.sleep(100).then(() => false),
+			]);
+			response.resolve({ action: "accept", content: { decision: "keep" } });
+			await proposalFinished.promise;
+			expect(finishedBeforeResponse).toBe(true);
+			expect(session.planModeState?.enabled).toBe(true);
+			expect(session.planReferenceSent).toBe(false);
+			expect(session.sessionId).toBe(created.sessionId);
+		} finally {
+			response.resolve({ action: "cancel" });
+			await harness.agent.dispose();
+		}
+	});
+
+	it("does not dispatch approved execution after cancellation during compaction", async () => {
+		const compacting = Promise.withResolvers<void>();
+		const releaseCompact = Promise.withResolvers<void>();
+		const harness = await createHarness({
+			elicitationHandler: async () => ({ action: "accept", content: { decision: "refine" } }),
+		});
+		try {
+			const { created, session } = await createPlanSession(harness);
+			await session.planProposalHandler!("words-counter");
+			const reviewId = reviewUpdates(harness.updates).find(update => update.review)?.review?.reviewId;
+			session.compact = async () => {
+				compacting.resolve();
+				await releaseCompact.promise;
+			};
+			const action = harness.agent.extMethod("omp.planReview/action", {
+				sessionId: created.sessionId,
+				reviewId,
+				decision: "compact",
+			});
+			await compacting.promise;
+			await harness.agent.cancel({ sessionId: created.sessionId });
+			releaseCompact.resolve();
+			expect(await action).toMatchObject({ ok: false });
+			expect(session.promptCalls).toEqual([]);
+			expect(session.planReferenceSent).toBe(false);
+		} finally {
+			releaseCompact.resolve();
+			await harness.agent.dispose();
+		}
+	});
+
 	it.each(["execute", "compact", "keep", "save"])(
 		"completes deferred %s inside the owning prompt at the allowed context boundary",
 		async decision => {
