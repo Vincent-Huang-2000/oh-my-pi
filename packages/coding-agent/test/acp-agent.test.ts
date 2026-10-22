@@ -4201,6 +4201,73 @@ describe("ACP agent MCP server configuration (late-connecting servers)", () => {
 		expect(reauthText).toContain("stdio servers manage their own credentials");
 	}, 15_000);
 
+	it("delivers remaining MCP startup failures on the replacement identity during plan review handoff", async () => {
+		const firstFailure = Promise.withResolvers<void>();
+		const releaseFailure = Promise.withResolvers<void>();
+		let held = false;
+		const harness = await createHarness({
+			elicitationHandler: async () => ({
+				action: "accept",
+				content: { decision: "save", savePath: "saved-plan.md" },
+			}),
+			sessionUpdateHook: async notification => {
+				if (
+					!held &&
+					notification.update.sessionUpdate === "agent_message_chunk" &&
+					notification.update.content.type === "text" &&
+					notification.update.content.text.includes("failed to connect")
+				) {
+					held = true;
+					firstFailure.resolve();
+					await releaseFailure.promise;
+				}
+			},
+		});
+		try {
+			cfgPlanEnabled.set(Settings.instance, true);
+			const created = await harness.agent.newSession({
+				cwd: harness.cwdA,
+				mcpServers: ["broken-one", "broken-two"].map(name => ({
+					name,
+					command: "/nonexistent/omp-fixture-binary",
+					args: [],
+					env: [],
+				})),
+			});
+			const session = harness.findSession(created.sessionId)!;
+			await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
+			const planPath = resolveLocalUrlToPath("local://handoff-plan.md", {
+				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+				getSessionId: () => session.sessionId,
+			});
+			await Bun.write(planPath, "# Handoff\n\nPreserve MCP startup diagnostics.");
+			await firstFailure.promise;
+			await session.planProposalHandler!("handoff");
+			expect(session.sessionId).not.toBe(created.sessionId);
+			releaseFailure.resolve();
+			await pollUntil(
+				() =>
+					harness.updates.filter(
+						notification =>
+							notification.update.sessionUpdate === "agent_message_chunk" &&
+							notification.update.content.type === "text" &&
+							notification.update.content.text.includes("failed to connect"),
+					).length === 2,
+			);
+			const replacementFailures = harness.updates.filter(
+				notification =>
+					notification.sessionId === session.sessionId &&
+					notification.update.sessionUpdate === "agent_message_chunk" &&
+					notification.update.content.type === "text" &&
+					notification.update.content.text.includes("failed to connect"),
+			);
+			expect(replacementFailures).toHaveLength(1);
+		} finally {
+			releaseFailure.resolve();
+			await harness.agent.dispose();
+		}
+	}, 15_000);
+
 	it("keeps an HTTP server with an expired client bearer reauthable through the real manager", async () => {
 		// The stdio spawn-failure test above does not prove the expired-bearer
 		// lifecycle: an HTTP 401 that settles inside MCPManager's 250 ms

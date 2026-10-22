@@ -3300,7 +3300,9 @@ export class AcpAgent implements Agent {
 		// MCP startup failures queued by `#configureMcpServers` flush here,
 		// behind the bootstrap race guard, so the client can finally attribute
 		// them to a session it knows.
-		for (const { name, message, oauthCapable } of record.pendingMcpStartupChunks.splice(0)) {
+		while (record.pendingMcpStartupChunks.length > 0) {
+			if (this.#sessions.get(sessionId) !== record) return;
+			const { name, message, oauthCapable } = record.pendingMcpStartupChunks.shift()!;
 			const recovery = oauthCapable
 				? `until it is reauthorized (/mcp reauth ${name}) or the client restarts the session`
 				: "until the client restarts the session";
