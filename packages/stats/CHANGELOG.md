@@ -2,6 +2,92 @@
 
 ## [Unreleased]
 
+## [18.12.0] - 2026-10-17
+
+### Fixed
+
+- Fixed usage stats pricing Google Antigravity and MiniMax Token Plan models at $0 when their catalog rows carry no price; they now use the catalog's pricing peer, as `xai-oauth` already did ([#16092](https://github.com/can1357/oh-my-pi/pull/16092) by [@H4vC](https://github.com/H4vC))
+
+## [18.11.0] - 2026-10-14
+
+### Fixed
+
+- Providers → Subscription windows no longer mixes Codex 5-hour and 7-day quotas across plans: Team and weekly-only (ProLite) accounts now share the 7-day row, the 5-hour row counts only accounts that have one, and labels no longer flip with whichever account reported last ([#15664](https://github.com/can1357/oh-my-pi/issues/15664))
+
+## [18.10.4] - 2026-10-13
+
+### Fixed
+
+- Usage recorded at $0 for a model whose catalog price changes on a date (Gemini 4 Argon, Devin SWE-2) is now priced at the rate in force on the request's date, instead of staying $0 like peak/off-peak tariff usage ([#15620](https://github.com/can1357/oh-my-pi/pull/15620) by [@eggpeat](https://github.com/eggpeat))
+
+## [18.9.0] - 2026-10-11
+
+### Fixed
+
+- Fixed the stats dashboard favicon so dashboard tabs and bookmarks display the OMP icon correctly.
+
+## [18.8.0] - 2026-10-07
+
+### Changed
+
+- Improved dashboard responsiveness and efficiency by reducing unnecessary data refreshes and re-rendering, speeding up session synchronization, database access, package imports, and usage, model, and time-series requests, and avoiding repeated downloads of unchanged traces.
+- Dashboard requests are now cancelled when no longer needed, improving responsiveness when switching sessions or closing trace views during loading.
+
+## [18.7.0] - 2026-10-06
+
+### Fixed
+
+- Fixed Ultrafast turns not being counted toward the Premium Requests statistic.
+- Fixed the desktop stats dashboard menu button so it no longer appears unnecessarily or dims the page without opening navigation.
+
+## [18.6.0] - 2026-10-03
+
+### Fixed
+
+- Fixed the Frustration page splitting DeepSeek V4 provider variants and the V4.1 Flash alias into separate model-version rows ([#14194](https://github.com/can1357/oh-my-pi/issues/14194)).
+
+## [18.5.1] - 2026-10-03
+
+### Fixed
+
+- Fixed stats dashboard request rows for Judge and other role-model calls so they open correctly and display usage details.
+- Fixed stats and summary error-rate formatting so small nonzero percentages are displayed accurately instead of as 0.0%.
+- Fixed a visual fringe on the edges of the stats dashboard’s “Classify with judge” button.
+
+## [18.4.4] - 2026-09-29
+
+### Added
+
+- Added the `printStatsSummary` export, shared by `omp-stats --sync` and `omp stats --summary`.
+
+## [18.4.3] - 2026-09-28
+
+### Fixed
+
+- Fixed `omp stats` dashboard numbers following the browser locale while the rest of the UI is English (e.g. `546 B` meaning 546 thousand and `$38.003,33` on a Turkish browser); figures now always use en-US formatting ([#13640](https://github.com/can1357/oh-my-pi/pull/13640) by [@NaC-L](https://github.com/NaC-L))
+
+## [18.4.1] - 2026-09-28
+
+### Fixed
+
+- Fixed `/trace` and `omp stats` dashboards failing to load after operating-system temporary-file cleanup ([#13487](https://github.com/can1357/oh-my-pi/pull/13487) by [@Peter-Tam](https://github.com/Peter-Tam)).
+
+## [18.4.0] - 2026-09-28
+
+### Changed
+
+- Redesigned the dashboard: new layout, navigation (`g` + letter to jump, `1`–`6` to pick a range), sortable tables and in-house charts on every page
+- The dashboard opens immediately and ingests sessions in the background, most recent activity first, with live progress in the header; pages update as data lands and new session activity appears within seconds
+- Switching time ranges is now near-instant: range queries read hourly rollups instead of scanning every request (seconds → milliseconds on large histories)
+- Frustration judge runs now scale how many requests they keep in flight (up to 256, backing off on rate limits and retrying after a short delay) and save verdicts in batches; the progress line shows the rate and requests in flight
+- Provider subscription windows load separately from the rest of the Providers page, and the Projects page lists the 2,000 busiest folders
+- Replaced the dashboard's Behavior page with a Frustration page showing, per model version, how often users are annoyed, annoyed at the assistant, and angry at it; a button judges unclassified messages with the host's `judge` model (after a cost estimate) and the chart refines live as verdicts arrive
+
+### Fixed
+
+- Made session-statistics synchronization atomic to prevent duplicate entries when synchronization is interrupted.
+- Improved the speed and reliability of initial and repeat `omp stats` imports, including large session histories and already-indexed histories.
+
 ## [18.2.9] - 2026-09-22
 
 ### Fixed

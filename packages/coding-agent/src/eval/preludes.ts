@@ -1,7 +1,7 @@
 import type { AgentToolContext, AgentToolResult, AgentToolUpdateCallback, ToolApproval } from "@oh-my-pi/pi-agent-core";
 import { untilAborted } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "../tools";
-import { denyError, formatApprovalPrompt, resolveApproval, resolveApprovalFromContext } from "../tools/approval";
+import { denyError, requestApproval, resolveApproval, resolveApprovalFromContext } from "../tools/approval";
 
 /** Host context supplied when an eval prelude calls back out of its language VM. */
 export interface EvalPreludeContext {
@@ -34,8 +34,12 @@ export interface EvalPreludeDefinition {
 	python: string;
 	/** Globals owned by the snippets and removed when the prelude is replaced or disabled. */
 	exports: readonly string[];
-	/** Optional declarations appended to code-mode TypeScript context while enabled. */
-	codeModeDeclarations?: string;
+	/**
+	 * Model-facing policy appended as its own system-prompt block while this
+	 * prelude is advertised. Replayed by the hidden prelude notice when enabled
+	 * mid-session, since the cached system prompt is not rebuilt for the toggle.
+	 */
+	guidance?: string;
 	/** Approval tier or argument-dependent approval decision for host calls. */
 	approval?: ToolApproval;
 	/** Live availability predicate. Omission means enabled. */
@@ -62,6 +66,12 @@ export function getEnabledEvalPreludes(definitions: readonly EvalPreludeDefiniti
 		if (definition.enabled?.() !== false) enabledByName.set(definition.name, definition);
 	}
 	return Array.from(enabledByName.values());
+}
+
+/** First documentation line, advertised as the prelude's one-line summary; undefined when undocumented. */
+export function evalPreludeSummary(definition: Pick<EvalPreludeDefinition, "documentation">): string | undefined {
+	const doc = definition.documentation.trim();
+	return doc ? doc.split("\n", 1)[0] : undefined;
 }
 
 /** Resolve a prelude from the session's live enabled set. Captured stale VM functions therefore fail closed. */
@@ -95,10 +105,10 @@ async function approvePreludeInvocation(
 				`Set tools.approval.${definition.name}: allow or use an interactive UI to approve the call.`,
 		);
 	}
-	const choice = await untilAborted(context.signal, () =>
-		ui.select(formatApprovalPrompt(subject, parameters, resolved.reason), ["Approve", "Deny"]),
+	const answer = await untilAborted(context.signal, () =>
+		requestApproval(ui, subject, parameters, { reason: resolved.reason }),
 	);
-	if (choice !== "Approve") throw new Error(`Eval prelude call denied by user: ${definition.name}`);
+	if (answer === "deny") throw new Error(`Eval prelude call denied by user: ${definition.name}`);
 }
 
 /**

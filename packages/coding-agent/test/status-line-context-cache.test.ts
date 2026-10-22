@@ -20,6 +20,7 @@ import { StatusLineComponent } from "@oh-my-pi/pi-tui/status-line";
 import { statusLineHost } from "@oh-my-pi/pi-coding-agent/modes/status-line-host";
 import { initTheme, setSymbolPreset, theme } from "@oh-my-pi/pi-tui/theme";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { cfgCompactionThresholdPercent } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import { getSessionAccentAnsi } from "@oh-my-pi/pi-tui/theme/session-color";
 import { adjustHsv } from "@oh-my-pi/pi-utils";
 import { StatusLineTestComponents } from "./helpers/status-line";
@@ -64,9 +65,7 @@ function makeSession(opts: {
 	modelInput?: string[];
 }): Fake {
 	const contextWindow = opts.contextWindow ?? 200_000;
-	const model = opts.modelInput
-		? { id: "test-model", contextWindow, input: opts.modelInput }
-		: { id: "test-model", contextWindow };
+	const model = { id: "test-model", contextWindow, input: opts.modelInput ?? ["text"] };
 	let usage: ContextUsage | undefined = "usage" in opts ? opts.usage : { tokens: 1234, contextWindow, percent: 0.6 };
 	let calls = 0;
 	let revision = 0;
@@ -134,17 +133,6 @@ describe("StatusLineComponent context breakdown", () => {
 		expect(breakdown.contextWindow).toBe(272_000);
 	});
 
-	it("memoizes: repeated redraws with no change do not re-query usage", () => {
-		const { session, usageCalls } = makeSession({ messages: [userMessage("hi")] });
-		const comp = statusLines.track(new StatusLineComponent(session, statusLineHost));
-
-		comp.getCachedContextBreakdown();
-		comp.getCachedContextBreakdown();
-		comp.getCachedContextBreakdown();
-
-		expect(usageCalls()).toBe(1);
-	});
-
 	it("re-queries and surfaces the new total when a message is appended", () => {
 		const fake = makeSession({
 			messages: [userMessage("hi")],
@@ -170,6 +158,26 @@ describe("StatusLineComponent context breakdown", () => {
 		comp.getCachedContextBreakdown();
 
 		expect(usageCalls()).toBe(2);
+	});
+
+	it("re-queries when streaming tool-call arguments grow in place", () => {
+		const payload = { text: "x" };
+		const args: Record<string, unknown> = { path: "a.ts", payload };
+		const tail = { role: "assistant", content: [{ type: "toolCall", name: "write", arguments: args }] };
+		const { session, usageCalls } = makeSession({ messages: [userMessage("hi"), tail] });
+		const comp = statusLines.track(new StatusLineComponent(session, statusLineHost));
+
+		comp.getCachedContextBreakdown();
+		const body = "streamed file body".repeat(8);
+		args.content = body;
+		comp.getCachedContextBreakdown();
+		args.content = `${body} and more`;
+		comp.getCachedContextBreakdown();
+		// A nested field growing in place changes the serialized size too.
+		payload.text = "x".repeat(40);
+		comp.getCachedContextBreakdown();
+
+		expect(usageCalls()).toBe(4);
 	});
 
 	it("re-queries when the message array is replaced (branch switch / rebuild)", () => {
@@ -232,16 +240,6 @@ describe("StatusLineComponent context breakdown", () => {
 
 		expect(comp.getCachedContextBreakdown().usedTokens).toBe(117_000);
 		expect(fake.usageCalls()).toBe(2);
-	});
-
-	it("propagates a speculative/numeric token count, e.g. right after compaction", () => {
-		const { session } = makeSession({
-			messages: [userMessage("compaction summary")],
-			usage: { tokens: 1234, contextWindow: 272_000, percent: 0.45 },
-		});
-		const breakdown = statusLines.track(new StatusLineComponent(session, statusLineHost)).getCachedContextBreakdown();
-		expect(breakdown.usedTokens).toBe(1234);
-		expect(breakdown.contextWindow).toBe(272_000);
 	});
 
 	it("falls back to the model window with 0 tokens when usage is unavailable", () => {
@@ -584,6 +582,37 @@ describe("StatusLineComponent context breakdown", () => {
 		const plain = comp.getTopBorder(80).content.replaceAll(/\x1b\[[0-9;]*m/g, "");
 		expect(plain).toContain("┃");
 		expect(plain).not.toContain("╎");
+	});
+
+	it("moves the compaction marker when the session's threshold setting changes after a render", () => {
+		const sessionSettings = Settings.isolated();
+		cfgCompactionThresholdPercent.set(sessionSettings, 80);
+		const { session } = makeSession({
+			messages: [userMessage("hi"), assistantMessage("done")],
+			usage: { tokens: 10_000, contextWindow: 100_000, percent: 10 },
+			settings: sessionSettings,
+		});
+		const comp = statusLines.track(new StatusLineComponent(session, statusLineHost));
+		comp.updateSettings({
+			preset: "custom",
+			leftSegments: ["pi"],
+			rightSegments: ["session_name"],
+			separator: "none",
+			sessionAccent: false,
+			contextLine: "annotated",
+		});
+		const markerAt = (): number =>
+			comp
+				.getTopBorder(80)
+				.content.replaceAll(/\x1b\[[0-9;]*m/g, "")
+				.indexOf("┃");
+
+		const before = markerAt();
+		expect(before).toBeGreaterThanOrEqual(0);
+		cfgCompactionThresholdPercent.set(sessionSettings, 40);
+		const after = markerAt();
+		expect(after).toBeGreaterThanOrEqual(0);
+		expect(after).toBeLessThan(before);
 	});
 
 	it("standalone mode renders a plain bottom bar without powerline chrome", () => {

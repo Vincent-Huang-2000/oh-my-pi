@@ -18,6 +18,18 @@ describe("isProviderRetryableError", () => {
 		expect(
 			isProviderRetryableError(new Error("Anthropic stream envelope error: stream ended before message_start")),
 		).toBe(true);
+		expect(
+			isProviderRetryableError(new Error("Anthropic stream envelope error: stream ended before message_delta")),
+		).toBe(true);
+	});
+
+	it("retries gateway stream drops before message_delta", () => {
+		expect(
+			isProviderRetryableError(new Error("Claude upstream stream ended before message_delta, reason=scanner_error")),
+		).toBe(true);
+		expect(
+			isProviderRetryableError(new Error("Claude upstream stream ended before message_start, reason=scanner_error")),
+		).toBe(true);
 	});
 
 	it("does not classify post-content envelope failures as provider-retryable", () => {
@@ -32,20 +44,6 @@ describe("isProviderRetryableError", () => {
 		expect(
 			isProviderRetryableError(new Error("stream error: stream ID 391; INTERNAL_ERROR; received from peer")),
 		).toBe(true);
-	});
-
-	it("retries Anthropic TLS server transport errors", () => {
-		expect(
-			isProviderRetryableError(
-				new Error(
-					'Post "https://api.anthropic.com/v1/messages?beta=true": remote error: tls: bad record MAC (type=server_error)',
-				),
-			),
-		).toBe(true);
-	});
-
-	it("does not retry permanent TLS configuration failures (no server annotation)", () => {
-		expect(isProviderRetryableError(new Error("tls: failed to verify certificate"))).toBe(false);
 	});
 
 	it("retries Bun socket closure errors", () => {

@@ -21,7 +21,7 @@ import {
 	SKILLS_LOCK_FILE,
 	type SkillsLock,
 } from "../skillshare/manifest";
-import { getAncestorDirs } from "./builtin";
+import { getProjectAncestorDirs } from "./builtin";
 import { createSourceMeta, SOURCE_PATHS } from "./helpers";
 
 export const SKILLSHARE_PROVIDER_ID = "skillshare";
@@ -69,7 +69,8 @@ async function loadLockedSkill(
 		// Registry content is untrusted: keep `skill://` access inside the unpacked package.
 		containRoot: realStoreDir,
 		level,
-		_source: createSourceMeta(SKILLSHARE_PROVIDER_ID, skillPath, level, `skillshare:${id}@${entry.version}`),
+		// Namespace by package name, not by the versioned store path.
+		_source: createSourceMeta(SKILLSHARE_PROVIDER_ID, skillPath, level, `skillshare:${id}@${entry.version}`, name),
 	};
 }
 
@@ -89,9 +90,12 @@ async function loadLock(lockPath: string, level: "user" | "project", warnings: s
 /** Load every skill pinned by project locks (closest first) and the user lock. */
 export async function loadSkillshareSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 	const warnings: string[] = [];
-	const projectLocks = getAncestorDirs(ctx.cwd, ctx.repoRoot ?? ctx.home).map(({ dir }) =>
-		loadLock(path.join(dir, SOURCE_PATHS.native.projectDir, SKILLS_LOCK_FILE), "project", warnings),
-	);
+	const projectLocks: Promise<Skill[]>[] = [];
+	for await (const { dir } of getProjectAncestorDirs(ctx)) {
+		projectLocks.push(
+			loadLock(path.join(dir, SOURCE_PATHS.native.projectDir, SKILLS_LOCK_FILE), "project", warnings),
+		);
+	}
 	const userLock = loadLock(path.join(getAgentDir(), SKILLS_LOCK_FILE), "user", warnings);
 	const results = await Promise.all([...projectLocks, userLock]);
 	return { items: results.flat(), warnings };

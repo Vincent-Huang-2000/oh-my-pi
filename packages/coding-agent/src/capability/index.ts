@@ -62,8 +62,12 @@ const FOREIGN_USER_PROVIDERS: Record<string, true> = {
 /** Outstanding {@link initializeWithSettings} holds, oldest first; the newest one is bound. */
 const settingsHolds: { settings: Settings }[] = [];
 
-/** Settings instance provider switches are read from and persisted to (the newest hold), if any. */
-function boundSettings(): Settings | undefined {
+/**
+ * Settings instance the newest {@link initializeWithSettings} hold bound.
+ * Unset when nothing is bound; callers must not fall back to the process
+ * singleton or tests pick up the developer's config.
+ */
+export function boundSettings(): Settings | undefined {
 	return settingsHolds.at(-1)?.settings;
 }
 
@@ -331,6 +335,7 @@ export async function loadCapability<T>(
 	const home = os.homedir();
 	const repoRoot = await findRepoRoot(cwd);
 	const ctx: LoadContext = { cwd, home, repoRoot };
+	if (options.agentDir !== undefined) ctx.agentDir = options.agentDir;
 	if (options.providers) ctx.explicitProviders = new Set(options.providers);
 	if (options.includeDisabled) ctx.includeOptOutUserSources = true;
 	if (options.extensionRoots !== undefined) ctx.extensionRoots = options.extensionRoots;

@@ -1,9 +1,11 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, setSystemTime, vi } from "bun:test";
 import { AuthStorage, type FetchImpl, type Model, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import { searchXAI, XAIProvider } from "@oh-my-pi/pi-coding-agent/web/search/providers/xai";
+import { cfgModelProviderOrder } from "@oh-my-pi/pi-coding-agent/config/model-settings";
+import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { rankXAIProviders, searchXAI, XAIProvider } from "@oh-my-pi/pi-coding-agent/web/search/providers/xai";
 import { SearchProviderError } from "@oh-my-pi/pi-coding-agent/web/search/types";
 
 type CapturedRequest = {
@@ -113,12 +115,12 @@ describe("xAI web search provider", () => {
 				{ role: "system", content: "Use web search for current xAI facts." },
 				{ role: "user", content: "latest xAI web search" },
 			],
-			tools: [{ type: "web_search" }],
+			tools: [{ type: "web_search" }, { type: "x_search" }],
 			reasoning: { effort: "low" },
 			max_output_tokens: 512,
 			temperature: 0.2,
 		});
-		expect(capture.capturedRequest?.body?.tools).toEqual([{ type: "web_search" }]);
+		expect(capture.capturedRequest?.body?.tools).toEqual([{ type: "web_search" }, { type: "x_search" }]);
 		expect(capture.capturedRequest?.body).not.toHaveProperty("search_parameters");
 	});
 
@@ -149,6 +151,7 @@ describe("xAI web search provider", () => {
 		const body = capture.capturedRequest?.body;
 		expect(body?.tools).toEqual([
 			{ type: "web_search", filters: { excluded_domains: ["reddit.com", "news.ycombinator.com"] } },
+			{ type: "x_search" },
 		]);
 		const input = body?.input as { role: string; content: string }[];
 		expect(input[1]?.content).toBe("grok changelog");
@@ -162,6 +165,107 @@ describe("xAI web search provider", () => {
 		expect(capture.capturedRequest?.body?.tools).toEqual([
 			{ type: "web_search", filters: { allowed_domains: ["docs.x.ai"] } },
 		]);
+	});
+
+	it.each([
+		[
+			"site:x.com searches X only, with after:/before: as its date range",
+			"tern terminal site:x.com after:2026-10-01 before:2026-10-08",
+			[{ type: "x_search", from_date: "2026-10-01", to_date: "2026-10-08" }],
+		],
+		[
+			"mixed sites split web hosts from X hosts",
+			"tern site:github.com site:twitter.com",
+			[{ type: "web_search", filters: { allowed_domains: ["github.com"] } }, { type: "x_search" }],
+		],
+		[
+			"-site:x.com searches the web only",
+			"tern -site:x.com",
+			[{ type: "web_search", filters: { excluded_domains: ["x.com"] } }],
+		],
+		[
+			"from: authors search X only, limited to those handles",
+			"tern from:_can1357 from:@msuiche",
+			[{ type: "x_search", allowed_x_handles: ["_can1357", "msuiche"] }],
+		],
+		[
+			"-from: authors stay out of X results without dropping the web",
+			"tern -from:spam_bot",
+			[{ type: "web_search" }, { type: "x_search", excluded_x_handles: ["spam_bot"] }],
+		],
+		[
+			"site:x.com/<handle> searches X only, limited to that handle",
+			"tern site:x.com/_can1357",
+			[{ type: "x_search", allowed_x_handles: ["_can1357"] }],
+		],
+	])("routes %s", async (_caseName, query, tools) => {
+		const capture = captureFetch({ id: "resp_x_routing", model: "grok-4.7", output_text: "routed answer" });
+
+		await searchXAI({ ...makeParams(capture.fetchMock), query });
+
+		expect(capture.capturedRequest?.body?.tools).toEqual(tools);
+	});
+
+	it("starts the X date range at the recency window unless after:/before: bound it", async () => {
+		setSystemTime(new Date("2026-10-08T12:00:00Z"));
+		try {
+			const capture = captureFetch({ id: "resp_x_recency", model: "grok-4.7", output_text: "recent answer" });
+
+			await searchXAI({ ...makeParams(capture.fetchMock), recency: "week" });
+			expect(capture.capturedRequest?.body?.tools).toEqual([
+				{ type: "web_search" },
+				{ type: "x_search", from_date: "2026-10-01" },
+			]);
+
+			await searchXAI({ ...makeParams(capture.fetchMock), query: "tern before:2026-09-01", recency: "week" });
+			expect(capture.capturedRequest?.body?.tools).toEqual([
+				{ type: "web_search" },
+				{ type: "x_search", to_date: "2026-09-01" },
+			]);
+		} finally {
+			setSystemTime();
+		}
+	});
+
+	it("ranks the xai-oauth login above an xai API key unless modelProviderOrder says otherwise", async () => {
+		const settings = await Settings.init({ inMemory: true });
+		try {
+			const engine = { ...xaiModel("parallel", "web"), webSearch: undefined };
+			const chain = [xaiModel("grok-4.5", "xai"), engine, xaiModel("grok-4.5", "xai-oauth")];
+			const order = () => rankXAIProviders(chain, model => model, settings).map(model => model.provider);
+
+			// xAI entries swap within their slots; the engine between them stays put.
+			expect(order()).toEqual(["xai-oauth", "web", "xai"]);
+
+			cfgModelProviderOrder.set(settings, ["xai"]);
+			expect(order()).toEqual(["xai", "web", "xai-oauth"]);
+		} finally {
+			resetSettingsForTest();
+		}
+	});
+
+	it("titles X post citations by URL instead of their numeric citation markers", async () => {
+		const capture = captureFetch({
+			id: "resp_x_citations",
+			model: "grok-4.7",
+			output: [
+				{ type: "custom_tool_call", name: "x_keyword_search", input: '{"query":"tern"}' },
+				{
+					type: "message",
+					content: [
+						{
+							type: "output_text",
+							text: "Tern is popular. [[1]](https://x.com/user/status/1)",
+							annotations: [{ type: "url_citation", url: "https://x.com/user/status/1", title: "1" }],
+						},
+					],
+				},
+			],
+		});
+
+		const response = await searchXAI(makeParams(capture.fetchMock));
+
+		expect(response.sources.map(source => source.title)).toEqual(["https://x.com/user/status/1"]);
 	});
 
 	it("uses credentials for the selected xAI OAuth model provider", async () => {
@@ -236,24 +340,9 @@ describe("xAI web search provider", () => {
 		oauthAuthStorage.close();
 	});
 
-	it("omits search_parameters for minimal web_search requests", async () => {
-		const capture = captureFetch({ id: "resp_minimal", model: "grok-4.3", output_text: "minimal xAI answer" });
-
-		await searchXAI(makeParams(capture.fetchMock));
-
-		expect(capture.capturedRequest).not.toBeNull();
-		const body = capture.capturedRequest?.body;
-		expect(body?.tools).toEqual([{ type: "web_search" }]);
-		expect(body?.reasoning).toEqual({ effort: "low" });
-		expect(body).not.toHaveProperty("search_parameters");
-	});
-
 	it.each([
-		["limit", { limit: 6 }],
-		["numSearchResults", { numSearchResults: 7 }],
 		["recency", { recency: "week" }],
 		["limit, numSearchResults, and recency", { limit: 0, numSearchResults: 30, recency: "day" }],
-		["oversized numSearchResults", { numSearchResults: 99 }],
 	] as const)("keeps %s local instead of sending xAI search_parameters", async (_caseName, searchParams) => {
 		const capture = captureFetch({ id: "resp_agent_tools", model: "grok-4.3", output_text: "xAI answer" });
 
@@ -264,7 +353,6 @@ describe("xAI web search provider", () => {
 
 		expect(capture.capturedRequest).not.toBeNull();
 		const body = capture.capturedRequest?.body;
-		expect(body?.tools).toEqual([{ type: "web_search" }]);
 		expect(body).not.toHaveProperty("search_parameters");
 		expect(Object.keys(body ?? {}).sort()).toEqual(["input", "model", "reasoning", "tools"]);
 	});
@@ -291,7 +379,6 @@ describe("xAI web search provider", () => {
 
 		expect(capture.capturedRequests).toHaveLength(1);
 		const body = capture.capturedRequests[0]?.body;
-		expect(body?.tools).toEqual([{ type: "web_search" }]);
 		expect(body).not.toHaveProperty("search_parameters");
 		expect(Object.keys(body ?? {}).sort()).toEqual(["input", "model", "reasoning", "tools"]);
 	});
@@ -420,7 +507,6 @@ describe("xAI web search provider", () => {
 		expect(response.citations?.map(citation => citation.url)).toEqual(expectedUrls);
 		expect(capture.capturedRequest).not.toBeNull();
 		const body = capture.capturedRequest?.body;
-		expect(body?.tools).toEqual([{ type: "web_search" }]);
 		expect(body).not.toHaveProperty("search_parameters");
 		expect(Object.keys(body ?? {}).sort()).toEqual(["input", "model", "reasoning", "tools"]);
 	});
@@ -446,7 +532,6 @@ describe("xAI web search provider", () => {
 		expect(response.citations?.map(citation => citation.url)).toEqual(expectedUrls);
 		expect(capture.capturedRequest).not.toBeNull();
 		const body = capture.capturedRequest?.body;
-		expect(body?.tools).toEqual([{ type: "web_search" }]);
 		expect(body).not.toHaveProperty("search_parameters");
 		expect(Object.keys(body ?? {}).sort()).toEqual(["input", "model", "reasoning", "tools"]);
 	});
@@ -514,7 +599,6 @@ describe("xAI web search provider", () => {
 		]);
 		expect(capture.capturedRequest).not.toBeNull();
 		const body = capture.capturedRequest?.body;
-		expect(body?.tools).toEqual([{ type: "web_search" }]);
 		expect(body).not.toHaveProperty("search_parameters");
 		expect(Object.keys(body ?? {}).sort()).toEqual(["input", "model", "reasoning", "tools"]);
 	});
@@ -558,7 +642,6 @@ describe("xAI web search provider", () => {
 		]);
 		expect(capture.capturedRequest).not.toBeNull();
 		const body = capture.capturedRequest?.body;
-		expect(body?.tools).toEqual([{ type: "web_search" }]);
 		expect(body).not.toHaveProperty("search_parameters");
 		expect(Object.keys(body ?? {}).sort()).toEqual(["input", "model", "reasoning", "tools"]);
 	});
@@ -652,7 +735,7 @@ describe("xAI web search provider", () => {
 			.mockResolvedValueOnce({ apiKey: "initial-xai-key" })
 			.mockResolvedValueOnce({ apiKey: "refreshed-xai-key" })
 			.mockResolvedValueOnce({ apiKey: "rotated-xai-key" });
-		const rotateSpy = vi.spyOn(authStorage.limits, "rotate").mockResolvedValue(true);
+		const rotateSpy = vi.spyOn(authStorage.limits, "rotate").mockResolvedValue({ switched: true });
 		const fetchMock: FetchImpl = (_input, init) => {
 			requestCount += 1;
 			authorizationHeaders.push(new Headers(init?.headers).get("authorization") ?? "");

@@ -46,6 +46,7 @@ class FakeAgentSession {
 	customCommands: [] = [];
 	promptCalls: string[] = [];
 	followUpCalls: string[] = [];
+	steerCalls: string[] = [];
 	compactCalls: Array<{ instructions: string | undefined; options: unknown }> = [];
 	applyRoleModelCalls: Array<{ role: string }> = [];
 	planModeState: { enabled: boolean; planFilePath: string; workflow?: string; reentry?: boolean } | undefined;
@@ -90,6 +91,12 @@ class FakeAgentSession {
 
 	async followUp(text: string): Promise<void> {
 		this.followUpCalls.push(text);
+	}
+
+	async joinActiveTurn(text: string): Promise<boolean> {
+		if (!this.isStreaming) return false;
+		this.steerCalls.push(text);
+		return true;
 	}
 
 	async compact(instructions?: string, options?: unknown): Promise<void> {
@@ -485,6 +492,238 @@ describe("planReviewExecutionModels", () => {
 });
 
 describe("ACP plan review", () => {
+	it("steering during review keeps the approval gate and idle steering leaves the review reopenable", async () => {
+		const opened = Promise.withResolvers<void>();
+		const response = Promise.withResolvers<CreateElicitationResponse>();
+		const harness = await createHarness({
+			elicitationHandler: async () => {
+				opened.resolve();
+				return response.promise;
+			},
+		});
+		try {
+			const { created, session } = await createPlanSession(harness);
+			session.prompt = async () => {
+				session.isStreaming = true;
+				await session.planProposalHandler!("words-counter");
+				session.isStreaming = false;
+				session.emit({ type: "agent_end", messages: [] });
+				return true;
+			};
+			const running = harness.agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "plan" }],
+			});
+			await opened.promise;
+			expect(
+				await harness.agent.extMethod("_session/steering", {
+					sessionId: created.sessionId,
+					prompt: [{ type: "text", text: "also cover empty input" }],
+				}),
+			).toEqual({ outcome: "injected", queue: "steering" });
+			expect(session.steerCalls).toEqual(["also cover empty input"]);
+			expect(session.planModeState?.enabled).toBe(true);
+			expect(session.planReferenceSent).toBe(false);
+			response.resolve({ action: "accept", content: { decision: "refine" } });
+			await running;
+			expect(
+				await harness.agent.extMethod("_session/steering", {
+					sessionId: created.sessionId,
+					prompt: [{ type: "text", text: "continue planning" }],
+				}),
+			).toEqual({ outcome: "promptRequired", queue: "steering" });
+			expect((await harness.agent.extMethod("omp.planReview/reopen", { sessionId: created.sessionId })).ok).toBe(
+				true,
+			);
+			expect(session.planModeState?.enabled).toBe(true);
+		} finally {
+			response.resolve({ action: "cancel" });
+			await harness.agent.dispose();
+		}
+	});
+
+	it("cancellation while agent_end waits for idle discards deferred approval without consuming the review", async () => {
+		const waiting = Promise.withResolvers<void>();
+		const releaseIdle = Promise.withResolvers<void>();
+		const drained = Promise.withResolvers<void>();
+		const harness = await createHarness({
+			elicitationHandler: async () => ({ action: "accept", content: { decision: "execute" } }),
+		});
+		try {
+			const { created, session } = await createPlanSession(harness);
+			session.waitForIdle = async () => {
+				waiting.resolve();
+				await releaseIdle.promise;
+			};
+			session.drainAsyncJobDeliveriesForAcp = async () => {
+				drained.resolve();
+				return false;
+			};
+			session.prompt = async () => {
+				session.isStreaming = true;
+				await session.planProposalHandler!("words-counter");
+				session.emit({ type: "agent_end", messages: [] });
+				return true;
+			};
+			const running = harness.agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "plan" }],
+			});
+			await waiting.promise;
+			await harness.agent.cancel({ sessionId: created.sessionId });
+			releaseIdle.resolve();
+			await drained.promise;
+			expect((await running).stopReason).toBe("cancelled");
+			// Reopen reads the persisted state after the old event handler resumes.
+			expect((await harness.agent.extMethod("omp.planReview/reopen", { sessionId: created.sessionId })).ok).toBe(
+				true,
+			);
+			expect(session.sessionId).toBe(created.sessionId);
+			expect(session.planModeState?.enabled).toBe(true);
+			expect(session.planReferenceSent).toBe(false);
+		} finally {
+			releaseIdle.resolve();
+			await harness.agent.dispose();
+		}
+	});
+
+	it("cancels a pending review without waiting for the client and ignores late approval", async () => {
+		const opened = Promise.withResolvers<void>();
+		const response = Promise.withResolvers<CreateElicitationResponse>();
+		const proposalFinished = Promise.withResolvers<void>();
+		const harness = await createHarness({
+			elicitationHandler: async () => {
+				opened.resolve();
+				return response.promise;
+			},
+		});
+		try {
+			const { created, session } = await createPlanSession(harness);
+			session.prompt = async () => {
+				session.isStreaming = true;
+				await session.planProposalHandler!("words-counter");
+				proposalFinished.resolve();
+				return true;
+			};
+			const running = harness.agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "plan" }],
+			});
+			await opened.promise;
+			await harness.agent.cancel({ sessionId: created.sessionId });
+			expect((await running).stopReason).toBe("cancelled");
+			const finishedBeforeResponse = await Promise.race([
+				proposalFinished.promise.then(() => true),
+				Bun.sleep(100).then(() => false),
+			]);
+			response.resolve({ action: "accept", content: { decision: "keep" } });
+			await proposalFinished.promise;
+			expect(finishedBeforeResponse).toBe(true);
+			expect(session.planModeState?.enabled).toBe(true);
+			expect(session.planReferenceSent).toBe(false);
+			expect(session.sessionId).toBe(created.sessionId);
+		} finally {
+			response.resolve({ action: "cancel" });
+			await harness.agent.dispose();
+		}
+	});
+
+	it("cancels a review action accepted before its dispatch slot exists", async () => {
+		const harness = await createHarness({
+			elicitationHandler: async () => ({ action: "accept", content: { decision: "refine" } }),
+		});
+		try {
+			const { created, session } = await createPlanSession(harness);
+			await session.planProposalHandler!("words-counter");
+			const reviewId = reviewUpdates(harness.updates).find(update => update.review)?.review?.reviewId;
+			const action = harness.agent.extMethod("omp.planReview/action", {
+				sessionId: created.sessionId,
+				reviewId,
+				decision: "execute",
+			});
+			await harness.agent.cancel({ sessionId: created.sessionId });
+			expect(await action).toMatchObject({ ok: false });
+			expect(session.sessionId).toBe(created.sessionId);
+			expect(session.promptCalls).toEqual([]);
+			expect(session.planModeState?.enabled).toBe(true);
+			expect((await harness.agent.extMethod("omp.planReview/reopen", { sessionId: created.sessionId })).ok).toBe(
+				true,
+			);
+		} finally {
+			await harness.agent.dispose();
+		}
+	});
+
+	it("does not dispatch approved execution after cancellation during compaction", async () => {
+		const compacting = Promise.withResolvers<void>();
+		const releaseCompact = Promise.withResolvers<void>();
+		const harness = await createHarness({
+			elicitationHandler: async () => ({ action: "accept", content: { decision: "refine" } }),
+		});
+		try {
+			const { created, session } = await createPlanSession(harness);
+			await session.planProposalHandler!("words-counter");
+			const reviewId = reviewUpdates(harness.updates).find(update => update.review)?.review?.reviewId;
+			session.compact = async () => {
+				compacting.resolve();
+				await releaseCompact.promise;
+			};
+			const action = harness.agent.extMethod("omp.planReview/action", {
+				sessionId: created.sessionId,
+				reviewId,
+				decision: "compact",
+			});
+			await compacting.promise;
+			await harness.agent.cancel({ sessionId: created.sessionId });
+			releaseCompact.resolve();
+			expect(await action).toMatchObject({ ok: false });
+			expect(session.promptCalls).toEqual([]);
+			expect(session.planReferenceSent).toBe(false);
+		} finally {
+			releaseCompact.resolve();
+			await harness.agent.dispose();
+		}
+	});
+
+	it("closing during fresh-session creation cannot register a replacement or dispatch execution", async () => {
+		const replacing = Promise.withResolvers<void>();
+		const releaseReplacement = Promise.withResolvers<void>();
+		const harness = await createHarness({
+			elicitationHandler: async () => ({ action: "accept", content: { decision: "refine" } }),
+		});
+		try {
+			const { created, session } = await createPlanSession(harness);
+			await session.planProposalHandler!("words-counter");
+			const reviewId = reviewUpdates(harness.updates).find(update => update.review)?.review?.reviewId;
+			session.newSession = async () => {
+				replacing.resolve();
+				await releaseReplacement.promise;
+				session.sessionId = crypto.randomUUID();
+				return true;
+			};
+			const action = harness.agent.extMethod("omp.planReview/action", {
+				sessionId: created.sessionId,
+				reviewId,
+				decision: "execute",
+			});
+			await replacing.promise;
+			await harness.agent.closeSession({ sessionId: created.sessionId });
+			releaseReplacement.resolve();
+			expect(await action).toMatchObject({ ok: false });
+			expect(harness.updates.some(update => update.update._meta?.["omp.sessionReplacement"])).toBe(false);
+			expect(session.promptCalls).toEqual([]);
+			await expect(
+				harness.agent.prompt({
+					sessionId: session.sessionId,
+					prompt: [{ type: "text", text: "continue" }],
+				}),
+			).rejects.toThrow();
+		} finally {
+			releaseReplacement.resolve();
+			await harness.agent.dispose();
+		}
+	});
+
 	it.each(["execute", "compact", "keep", "save"])(
 		"completes deferred %s inside the owning prompt at the allowed context boundary",
 		async decision => {

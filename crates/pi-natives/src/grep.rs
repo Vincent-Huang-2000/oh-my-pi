@@ -10,13 +10,13 @@
 use std::{
 	borrow::Cow,
 	cell::RefCell,
-	fmt,
 	io::{self, Read},
 	path::Path,
 	sync::{
-		LazyLock,
-		atomic::{AtomicU64, Ordering},
+		Arc, LazyLock,
+		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
+	time::Duration,
 };
 
 use grep_matcher::Matcher;
@@ -28,23 +28,36 @@ use grep_searcher::{
 use napi::{
 	JsString,
 	bindgen_prelude::*,
-	threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode},
+	threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue},
 };
 use napi_derive::napi;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
+use pi_builtins::CompiledMatcher;
 use pi_vfs::{BlockingFs, File};
 use smallvec::SmallVec;
 
 use crate::{glob_util, iofs, shell::vfs::ShellFilesystem, task};
 
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
-/// PCRE2 JIT toggle: `OMP_PCRE2_JIT=1` forces JIT on, `0`/`false` forces it
-/// off. Unset, JIT stays on everywhere except macOS, where PCRE2's SLJIT
-/// executable allocator can fault while compiling patterns (issue #7399).
-static PCRE2_JIT_ENABLED: LazyLock<bool> = LazyLock::new(|| match std::env::var("OMP_PCRE2_JIT") {
-	Ok(v) if !v.is_empty() => v != "0" && !v.eq_ignore_ascii_case("false"),
-	_ => !cfg!(target_os = "macos"),
-});
+/// PCRE2 JIT toggle read once from the process environment; see
+/// [`pi_builtins::pcre2_jit_enabled`] for the `OMP_PCRE2_JIT` values.
+static PCRE2_JIT_ENABLED: LazyLock<bool> =
+	LazyLock::new(|| pi_builtins::pcre2_jit_enabled(std::env::var("OMP_PCRE2_JIT").ok().as_deref()));
+
+/// Upper bound on entries per streamed `onMatches` batch; a file with more
+/// content matches streams several batches while it is still being searched.
+const GREP_STREAM_BATCH: usize = 1024;
+/// Maximum batches awaiting JS acknowledgement; native waits enforce this
+/// bound without entering N-API's blocking queue path.
+const GREP_STREAM_QUEUE: usize = 8;
+/// Cancellation checks while producers await JS consumption.
+const GREP_STREAM_CANCEL_POLL: Duration = Duration::from_millis(10);
+
+/// `onMatches` callback, called without the error-first slot. The N-API queue
+/// stays unbounded; [`JsMatchStream`] reserves bounded capacity before
+/// enqueueing.
+type GrepStreamCallback =
+	ThreadsafeFunction<Vec<GrepMatch>, UnknownReturnValue, Vec<GrepMatch>, Status, false, false>;
 
 /// Output mode for [`search`] and [`grep`] (string values match JS callers).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,7 +113,8 @@ pub struct GrepOptions<'env> {
 	pub pattern:            String,
 	/// Directory or file to search: a host path or an absolute `scheme://` URL.
 	pub path:               String,
-	/// Glob filter for filenames (e.g., "*.ts").
+	/// Glob filter for file paths (e.g., "*.ts"); a matched directory selects
+	/// every file under it.
 	pub glob:               Option<String>,
 	/// Match simple glob patterns at any depth (default: true; `*.ts` ->
 	/// `**/*.ts`). Set false when `glob` is already relative to `path`.
@@ -140,6 +154,16 @@ pub struct GrepOptions<'env> {
 	/// Filesystem every path is stat'ed, walked, and read through (native when
 	/// absent).
 	pub filesystem:         Option<ShellFilesystem>,
+	/// Stream results instead of returning them: called on the JS thread with
+	/// batches (at most 1024 entries, files in no particular order) of what
+	/// `matches` would hold, while the search runs. A slow callback pauses the
+	/// search instead of buffering. Successful completion waits for every
+	/// callback and carries counts with empty `matches`; cancellation also
+	/// interrupts delivery waits, though already queued callbacks may still run.
+	/// A throw rejects the search with it. Incompatible with `maxCount` and
+	/// `offset`.
+	#[napi(ts_type = "(matches: GrepMatch[]) => void")]
+	pub on_matches:         Option<GrepStreamCallback>,
 }
 
 /// A context line (before or after a match).
@@ -165,6 +189,9 @@ pub struct Match {
 	pub context_after:  Option<Vec<ContextLine>>,
 	/// Whether the line was truncated.
 	pub truncated:      Option<bool>,
+	/// 1-indexed character column where the first match on a truncated line
+	/// starts; the truncated `line` shows a window around it.
+	pub column:         Option<u32>,
 }
 
 /// Result of searching content.
@@ -196,6 +223,9 @@ pub struct GrepMatch {
 	pub context_after:  Option<Vec<ContextLine>>,
 	/// Whether the line was truncated.
 	pub truncated:      Option<bool>,
+	/// 1-indexed character column where the first match on a truncated line
+	/// starts; the truncated `line` shows a window around it.
+	pub column:         Option<u32>,
 	/// Per-file match count (count mode only).
 	pub match_count:    Option<u32>,
 }
@@ -243,7 +273,14 @@ impl TypeFilter {
 // Internal match collection
 // ---------------------------------------------------------------------------
 
-struct MatchCollector {
+/// Receives streamed search output from any search worker thread.
+pub(crate) trait MatchSink: Send + Sync {
+	/// Take ownership of entries as they are found; an error stops the search.
+	fn deliver(&self, matches: Vec<GrepMatch>) -> Result<()>;
+}
+
+struct MatchCollector<'m, M> {
+	matcher:         &'m M,
 	matches:         Vec<CollectedMatch>,
 	match_count:     u64,
 	collected_count: u64,
@@ -263,6 +300,7 @@ struct CollectedMatch {
 	context_before: SmallVec<[ContextLine; 8]>,
 	context_after:  SmallVec<[ContextLine; 8]>,
 	truncated:      bool,
+	column:         Option<u32>,
 }
 
 struct SearchResultInternal {
@@ -302,14 +340,16 @@ impl SearchWorker {
 	}
 }
 
-impl MatchCollector {
+impl<'m, M: Matcher> MatchCollector<'m, M> {
 	fn new(
+		matcher: &'m M,
 		max_count: Option<u64>,
 		offset: u64,
 		max_columns: Option<usize>,
 		collect_matches: bool,
 	) -> Self {
 		Self {
+			matcher,
 			matches: Vec::new(),
 			match_count: 0,
 			collected_count: 0,
@@ -321,6 +361,78 @@ impl MatchCollector {
 			collect_matches,
 			context_before: SmallVec::new(),
 		}
+	}
+
+	fn for_params(matcher: &'m M, params: SearchParams) -> Self {
+		Self::new(
+			matcher,
+			params.max_count,
+			params.offset,
+			params.max_columns.map(|v| v as usize),
+			params.mode == OutputMode::Content,
+		)
+	}
+
+	fn into_result(self) -> SearchResultInternal {
+		SearchResultInternal {
+			matches:       self.matches,
+			match_count:   self.match_count,
+			collected:     self.collected_count,
+			limit_reached: self.limit_reached,
+		}
+	}
+}
+
+/// Content-mode collector that hands a file's matches to a [`MatchSink`] in
+/// chunks of [`GREP_STREAM_BATCH`] while the file is searched, so a dense file
+/// never accumulates all of its matching lines.
+struct StreamingCollector<'a, M> {
+	collector: MatchCollector<'a, M>,
+	sink:      &'a dyn MatchSink,
+	path:      &'a str,
+	/// Delivery failure that stopped the search; reported over search errors.
+	failure:   Option<Error>,
+}
+
+impl<M: Matcher> StreamingCollector<'_, M> {
+	fn flush(&mut self) -> io::Result<()> {
+		if self.collector.matches.is_empty() {
+			return Ok(());
+		}
+		let collected = std::mem::take(&mut self.collector.matches);
+		let mut batch = Vec::with_capacity(collected.len());
+		push_content_matches(&mut batch, self.path.to_owned(), collected.into_iter());
+		self.sink.deliver(batch).map_err(|err| {
+			let stopped = io::Error::other(err.reason.clone());
+			self.failure = Some(err);
+			stopped
+		})
+	}
+}
+
+impl<M: Matcher> Sink for StreamingCollector<'_, M> {
+	type Error = io::Error;
+
+	fn matched(
+		&mut self,
+		searcher: &Searcher,
+		mat: &SinkMatch<'_>,
+	) -> std::result::Result<bool, Self::Error> {
+		// Flush before collecting the next match: the searcher reports a match's
+		// after-context before the following match, so every pending match is
+		// complete here.
+		if self.collector.matches.len() >= GREP_STREAM_BATCH {
+			self.flush()?;
+		}
+		self.collector.matched(searcher, mat)
+	}
+
+	fn context(
+		&mut self,
+		searcher: &Searcher,
+		ctx: &SinkContext<'_>,
+	) -> std::result::Result<bool, Self::Error> {
+		self.collector.context(searcher, ctx)
 	}
 }
 
@@ -339,6 +451,102 @@ fn truncate_line(line: String, max_columns: Option<usize>) -> (String, bool) {
 	}
 }
 
+/// Fit a matched line wider than `max` bytes into `max` bytes so its first
+/// match (`first_match`, a byte range) stays visible. When the match fits in
+/// the head [`truncate_line`] keeps, the line is cut the same way; otherwise
+/// the kept window is centred on the match and each cut side is marked with
+/// `...`. Also returns the match's 1-indexed character column.
+fn window_matched_line(
+	line: &str,
+	max: usize,
+	first_match: Option<(usize, usize)>,
+) -> (String, Option<u32>) {
+	let head_end = line.floor_char_boundary(max.saturating_sub(3));
+	let Some((start, end)) = first_match else {
+		return (format!("{}...", &line[..head_end]), None);
+	};
+	let start = line.floor_char_boundary(start);
+	let column = Some(crate::utils::clamp_u32(line[..start].chars().count() as u64 + 1));
+	let body = max.saturating_sub(6);
+	if end <= head_end || body == 0 {
+		return (format!("{}...", &line[..head_end]), column);
+	}
+	// Centre the match; a match wider than the window shows from its start.
+	let lead = body.saturating_sub(end - start) / 2;
+	let from = start.saturating_sub(lead);
+	let window = if from + body >= line.len() {
+		// The window reaches the end of the line: only its start is cut.
+		let from = line.ceil_char_boundary(line.len() - max.saturating_sub(3));
+		format!("...{}", &line[from..])
+	} else {
+		let from = line.ceil_char_boundary(from);
+		let to = line.floor_char_boundary(from + body);
+		if from == 0 {
+			format!("{}...", &line[..to])
+		} else {
+			format!("...{}...", &line[from..to])
+		}
+	};
+	(window, column)
+}
+
+/// Byte range in `line` (the trimmed, decoded text of `mat`) of the first match
+/// the searcher reported in `mat`. Like ripgrep's printer
+/// (`find_iter_at_in_context`), it re-runs the matcher over the searcher's
+/// buffer from the block's start, so look-behind sees the preceding text; a
+/// single-line block drops its line terminator. A multi-line block keeps the
+/// rest of the buffer for look-ahead: the printer caps that at 128 bytes, which
+/// loses a match whose look-ahead reads further, and this one leftmost search
+/// stops at the block's match anyway.
+fn first_match_in_line<M: Matcher>(
+	searcher: &Searcher,
+	matcher: &M,
+	mat: &SinkMatch<'_>,
+	line: &str,
+) -> Option<(usize, usize)> {
+	let buffer = mat.buffer();
+	let range = mat.bytes_range_in_buffer();
+	let terminator = searcher.line_terminator();
+	let terminated = terminator.is_suffix(&buffer[range.clone()]);
+	let end = if searcher.multi_line_with_matcher(matcher) {
+		buffer.len()
+	} else {
+		let mut end = range.end;
+		if terminated {
+			end -= 1;
+			if terminator.is_crlf() && end > range.start && buffer[end - 1] == b'\r' {
+				end -= 1;
+			}
+		}
+		end
+	};
+	let found = matcher
+		.find_at(&buffer[..end], range.start)
+		.ok()
+		.flatten()?;
+	// A match at `range.end` begins on the next line, except an empty one
+	// (`$`, `\z`) after an unterminated last line.
+	if found.start() > range.end || (found.start() == range.end && terminated) {
+		return None;
+	}
+	let block = mat.bytes();
+	let (start, stop) = (found.start() - range.start, found.end().min(range.end) - range.start);
+	// `line` is `block` decoded and trimmed: offsets carry over unless lossy
+	// decoding replaced invalid bytes, which changes the byte lengths before
+	// them. An offset in the trimmed trailing whitespace maps to the end of
+	// `line`, the last column it shows.
+	let lossy = std::str::from_utf8(block).is_err();
+	let to_line = |offset: usize| -> usize {
+		let offset = if lossy {
+			String::from_utf8_lossy(&block[..offset]).len()
+		} else {
+			offset
+		};
+		line.floor_char_boundary(offset.min(line.len()))
+	};
+	Some((to_line(start), to_line(stop)))
+}
+
 fn bytes_to_trimmed_string(bytes: &[u8]) -> String {
 	match std::str::from_utf8(bytes) {
 		Ok(text) => text.trim_end().to_string(),
@@ -350,12 +558,12 @@ fn bytes_to_trimmed_string(bytes: &[u8]) -> String {
 // Sink implementation for grep-searcher
 // ---------------------------------------------------------------------------
 
-impl Sink for MatchCollector {
+impl<M: Matcher> Sink for MatchCollector<'_, M> {
 	type Error = io::Error;
 
 	fn matched(
 		&mut self,
-		_searcher: &Searcher,
+		searcher: &Searcher,
 		mat: &SinkMatch<'_>,
 	) -> std::result::Result<bool, Self::Error> {
 		self.match_count += 1;
@@ -372,7 +580,14 @@ impl Sink for MatchCollector {
 
 		if self.collect_matches {
 			let raw_line = bytes_to_trimmed_string(mat.bytes());
-			let (line, truncated) = truncate_line(raw_line, self.max_columns);
+			let (line, truncated, column) = match self.max_columns {
+				Some(max) if raw_line.len() > max => {
+					let first_match = first_match_in_line(searcher, self.matcher, mat, &raw_line);
+					let (line, column) = window_matched_line(&raw_line, max, first_match);
+					(line, true, column)
+				},
+				_ => (raw_line, false, None),
+			};
 			let line_number = mat.line_number().unwrap_or(0);
 
 			self.matches.push(CollectedMatch {
@@ -381,6 +596,7 @@ impl Sink for MatchCollector {
 				context_before: std::mem::take(&mut self.context_before),
 				context_after: SmallVec::new(),
 				truncated,
+				column,
 			});
 		} else {
 			self.context_before.clear();
@@ -542,77 +758,88 @@ struct SearchParams {
 	multiline:          bool,
 }
 
-enum CompiledMatcher {
-	Rust(RegexMatcher),
-	Pcre(PcreMatcher),
+/// What one search reads: bytes already in memory, or an explicitly named
+/// file streamed through the searcher's bounded buffer whatever its size.
+enum Haystack<'a> {
+	Slice(&'a [u8]),
+	Reader(CancellableReader<'a>),
 }
 
-#[derive(Debug)]
-enum CompiledMatcherError {
-	Rust(grep_matcher::NoError),
-	Pcre(grep_pcre2::Error),
-}
-
-impl fmt::Display for CompiledMatcherError {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Haystack<'_> {
+	fn search<M: Matcher, S: Sink<Error = io::Error>>(
+		self,
+		searcher: &mut Searcher,
+		matcher: &M,
+		sink: S,
+	) -> io::Result<()> {
 		match self {
-			Self::Rust(err) => err.fmt(formatter),
-			Self::Pcre(err) => err.fmt(formatter),
+			Haystack::Slice(content) => searcher.search_slice(matcher, content, sink),
+			Haystack::Reader(reader) => searcher.search_reader(matcher, reader, sink),
 		}
 	}
 }
 
-impl Matcher for CompiledMatcher {
-	type Captures = grep_matcher::NoCaptures;
-	type Error = CompiledMatcherError;
+/// A file read that fails once the search is cancelled or times out: streaming
+/// a large file can outlast the caller's deadline.
+struct CancellableReader<'a> {
+	file: File,
+	ct:   &'a task::CancelToken,
+}
 
-	fn find_at(
-		&self,
-		haystack: &[u8],
-		at: usize,
-	) -> std::result::Result<Option<grep_matcher::Match>, Self::Error> {
-		match self {
-			Self::Rust(matcher) => matcher
-				.find_at(haystack, at)
-				.map_err(CompiledMatcherError::Rust),
-			Self::Pcre(matcher) => matcher
-				.find_at(haystack, at)
-				.map_err(CompiledMatcherError::Pcre),
-		}
-	}
-
-	fn new_captures(&self) -> std::result::Result<Self::Captures, Self::Error> {
-		Ok(grep_matcher::NoCaptures::new())
+impl io::Read for CancellableReader<'_> {
+	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+		self
+			.ct
+			.heartbeat()
+			.map_err(|err| io::Error::other(err.reason))?;
+		self.file.read(buf)
 	}
 }
 
 fn run_search<M: Matcher + Sync>(
 	matcher: &M,
-	content: &[u8],
+	content: Haystack<'_>,
 	params: SearchParams,
 ) -> io::Result<SearchResultInternal> {
-	run_search_slice(&mut build_searcher_for_params(params), matcher, content, params)
+	run_search_in(&mut build_searcher_for_params(params), matcher, content, params)
 }
 
-fn run_search_slice<M: Matcher + Sync>(
+fn run_search_in<M: Matcher + Sync>(
 	searcher: &mut Searcher,
 	matcher: &M,
-	content: &[u8],
+	content: Haystack<'_>,
 	params: SearchParams,
 ) -> io::Result<SearchResultInternal> {
-	let mut collector = MatchCollector::new(
-		params.max_count,
-		params.offset,
-		params.max_columns.map(|v| v as usize),
-		params.mode == OutputMode::Content,
-	);
-	searcher.search_slice(matcher, content, &mut collector)?;
-	Ok(SearchResultInternal {
-		matches:       collector.matches,
-		match_count:   collector.match_count,
-		collected:     collector.collected_count,
-		limit_reached: collector.limit_reached,
-	})
+	let mut collector = MatchCollector::for_params(matcher, params);
+	content.search(searcher, matcher, &mut collector)?;
+	Ok(collector.into_result())
+}
+
+/// Content-mode search of `content` that streams its matches to `sink` as
+/// `path`; the returned result carries counts only. The outer error is a
+/// delivery failure that must stop the whole search; the inner one is a
+/// search failure of this file alone.
+fn run_streaming_search_in<M: Matcher + Sync>(
+	searcher: &mut Searcher,
+	matcher: &M,
+	content: Haystack<'_>,
+	params: SearchParams,
+	sink: &dyn MatchSink,
+	path: &str,
+) -> Result<io::Result<SearchResultInternal>> {
+	let mut collector = StreamingCollector {
+		collector: MatchCollector::for_params(matcher, params),
+		sink,
+		path,
+		failure: None,
+	};
+	let searched = content
+		.search(searcher, matcher, &mut collector)
+		.and_then(|()| collector.flush());
+	if let Some(err) = collector.failure {
+		return Err(err);
+	}
+	Ok(searched.map(|()| collector.collector.into_result()))
 }
 
 fn build_searcher_for_params(params: SearchParams) -> Searcher {
@@ -663,8 +890,15 @@ fn build_searcher(
 		.multi_line(multiline)
 		.before_context(context_before as usize)
 		.after_context(context_after as usize)
+		// A streamed file's buffer grows to hold its longest line; a minified
+		// file can be one line, so bound it rather than load the whole file.
+		.heap_limit(Some(STREAM_LINE_LIMIT_BYTES))
 		.build()
 }
+
+/// Longest line a streamed search buffers before it fails instead of growing
+/// further; slices already in memory are unaffected.
+const STREAM_LINE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
 const FILE_CLASSIFICATION_READ_BYTES: u64 = MAX_FILE_BYTES + 1;
 
@@ -747,6 +981,7 @@ fn to_public_match(matched: CollectedMatch) -> Match {
 		context_before,
 		context_after,
 		truncated: if matched.truncated { Some(true) } else { None },
+		column: matched.column,
 	}
 }
 
@@ -768,6 +1003,7 @@ fn to_grep_match(path: String, matched: CollectedMatch) -> GrepMatch {
 		context_before,
 		context_after,
 		truncated: if matched.truncated { Some(true) } else { None },
+		column: matched.column,
 		match_count: None,
 	}
 }
@@ -775,11 +1011,11 @@ fn to_grep_match(path: String, matched: CollectedMatch) -> GrepMatch {
 fn push_content_matches(
 	matches: &mut Vec<GrepMatch>,
 	path: String,
-	collected_matches: Vec<CollectedMatch>,
+	collected_matches: impl ExactSizeIterator<Item = CollectedMatch>,
 ) {
 	let last_index = collected_matches.len().saturating_sub(1);
 	let mut path = Some(path);
-	for (index, matched) in collected_matches.into_iter().enumerate() {
+	for (index, matched) in collected_matches.enumerate() {
 		let match_path = if index == last_index {
 			path.take().expect("path is available for final match")
 		} else {
@@ -817,6 +1053,8 @@ pub(crate) struct GrepConfig {
 	pub(crate) max_count_per_file: Option<u32>,
 	/// Filesystem the search path is resolved, walked, and read through.
 	pub(crate) filesystem:         BlockingFs,
+	/// Receives results while searching instead of the returned `matches`.
+	pub(crate) stream:             Option<Arc<dyn MatchSink>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1074,20 +1312,35 @@ const ORDERED_STREAMING_STOP_MAX_COUNT: u64 = 64;
 const GREP_STREAM_WINDOW: usize = 512;
 
 fn per_file_params(params: SearchParams) -> SearchParams {
+	// Directory entries each apply the offset fresh, so fold it into the cap
+	// up front and delegate the mode match to `single_file_params`.
+	single_file_params(SearchParams {
+		max_count: params
+			.max_count
+			.map(|max| max.saturating_add(params.offset)),
+		offset: 0,
+		..params
+	})
+}
+
+/// `per_file_params` for a single explicit file, preserving `offset`.
+///
+/// The directory walks zero the offset because each file applies it fresh while
+/// accumulating a budget across files; a direct-file search applies it once to
+/// one stream, so it has to survive. `MatchCollector::matched` skips `offset`
+/// before counting against `max_count`, so folding the cap in here keeps both
+/// meaningful — reusing `per_file_params` verbatim would silently drop the
+/// offset and shift every result on a paginated single-file search.
+fn single_file_params(params: SearchParams) -> SearchParams {
 	let file_limit = match params.mode {
-		OutputMode::Content => {
-			let global = params
-				.max_count
-				.map(|max| max.saturating_add(params.offset));
-			match (global, params.max_count_per_file) {
-				(Some(global), Some(per_file)) => Some(global.min(per_file)),
-				(global, per_file) => global.or(per_file),
-			}
+		OutputMode::Content => match (params.max_count, params.max_count_per_file) {
+			(Some(global), Some(per_file)) => Some(global.min(per_file)),
+			(global, per_file) => global.or(per_file),
 		},
 		OutputMode::Count => None,
 		OutputMode::FilesWithMatches => Some(1),
 	};
-	SearchParams { max_count: file_limit, offset: 0, ..params }
+	SearchParams { max_count: file_limit, ..params }
 }
 
 fn streaming_stop_after(params: SearchParams) -> Option<u64> {
@@ -1112,7 +1365,7 @@ fn search_file_bytes<M: Matcher + Sync>(
 			limit_reached: false,
 		});
 	}
-	run_search_slice(searcher, matcher, bytes, params).ok()
+	run_search_in(searcher, matcher, Haystack::Slice(bytes), params).ok()
 }
 
 fn build_grep_walk_request(
@@ -1126,8 +1379,9 @@ fn build_grep_walk_request(
 ) -> Result<pi_walker::WalkRequest> {
 	let mut filter = pi_walker::WalkFilter::files_only();
 	if let Some(pattern) = glob {
-		let compiled = pi_walker::CompiledWalkGlob::new([pattern])
-			.map_err(|err| Error::from_reason(format!("Invalid glob pattern: {err}")))?;
+		let compiled =
+			pi_walker::CompiledWalkGlob::new(glob_util::search_scope_patterns(pattern.to_owned()))
+				.map_err(|err| Error::from_reason(format!("Invalid glob pattern: {err}")))?;
 		filter = filter.glob(compiled);
 	}
 
@@ -1209,29 +1463,79 @@ enum FileOutcome {
 /// Shared accumulator across both search passes.
 ///
 /// `results` is drained between passes; `deferred` is filled by pass 1 and
-/// consumed by pass 2; the counters accumulate across both.
-struct PassState {
+/// consumed by pass 2; the counters accumulate across both. With a `sink`,
+/// matching files stream their entries instead of filling `results`, and only
+/// the `streamed_*` totals remain.
+struct PassState<'a> {
 	/// Filesystem every candidate is read through.
-	fs:                BlockingFs,
-	results:           Mutex<Vec<FileSearchResult>>,
-	deferred:          Mutex<Vec<pi_walker::FileCandidate>>,
-	files_searched:    AtomicU64,
-	skipped_oversized: AtomicU64,
-	emitted:           AtomicU64,
+	fs:                     BlockingFs,
+	results:                Mutex<Vec<FileSearchResult>>,
+	deferred:               Mutex<Vec<pi_walker::FileCandidate>>,
+	files_searched:         AtomicU64,
+	skipped_oversized:      AtomicU64,
+	emitted:                AtomicU64,
+	sink:                   Option<&'a dyn MatchSink>,
+	streamed_matches:       AtomicU64,
+	streamed_files:         AtomicU64,
+	streamed_limit_reached: AtomicBool,
 }
 
-impl PassState {
+impl<'a> PassState<'a> {
 	fn new(fs: &BlockingFs) -> Self {
+		Self::with_sink(fs, None)
+	}
+
+	fn with_sink(fs: &BlockingFs, sink: Option<&'a dyn MatchSink>) -> Self {
 		Self {
-			fs:                fs.clone(),
-			results:           Mutex::default(),
-			deferred:          Mutex::default(),
-			files_searched:    AtomicU64::default(),
+			fs: fs.clone(),
+			results: Mutex::default(),
+			deferred: Mutex::default(),
+			files_searched: AtomicU64::default(),
 			skipped_oversized: AtomicU64::default(),
-			emitted:           AtomicU64::default(),
+			emitted: AtomicU64::default(),
+			sink,
+			streamed_matches: AtomicU64::default(),
+			streamed_files: AtomicU64::default(),
+			streamed_limit_reached: AtomicBool::default(),
+		}
+	}
+
+	/// Result of a streamed search: its totals, with every entry already
+	/// delivered to the sink.
+	fn streamed_result(&self) -> GrepResult {
+		let skipped_oversized = self.skipped_oversized.load(Ordering::Relaxed);
+		GrepResult {
+			matches:            Vec::new(),
+			total_matches:      crate::utils::clamp_u32(self.streamed_matches.load(Ordering::Relaxed)),
+			files_with_matches: crate::utils::clamp_u32(self.streamed_files.load(Ordering::Relaxed)),
+			files_searched:     crate::utils::clamp_u32(self.files_searched.load(Ordering::Relaxed)),
+			limit_reached:      self
+				.streamed_limit_reached
+				.load(Ordering::Relaxed)
+				.then_some(true),
+			skipped_oversized:  (skipped_oversized > 0)
+				.then(|| crate::utils::clamp_u32(skipped_oversized)),
 		}
 	}
 }
+
+/// Stream the entry a matching file contributes beyond its content matches
+/// (which [`StreamingCollector`] already delivered): its count or its path.
+fn stream_file_entry(
+	sink: &dyn MatchSink,
+	mode: OutputMode,
+	path: &str,
+	match_count: u64,
+) -> Result<()> {
+	let mut entry = Vec::with_capacity(1);
+	match mode {
+		OutputMode::Content => return Ok(()),
+		OutputMode::Count => push_count_match(&mut entry, path.to_owned(), match_count),
+		OutputMode::FilesWithMatches => push_file_match(&mut entry, path.to_owned()),
+	}
+	sink.deliver(entry)
+}
+
 /// Read the first [`MAX_FILE_BYTES`] of a file into owned bytes for searching.
 ///
 /// Used by the deferred oversized pass: files larger than the cap are searched
@@ -1263,6 +1567,8 @@ fn read_file_prefix(fs: &BlockingFs, path: &Path, buffer: &mut Vec<u8>) -> io::R
 }
 
 /// Read one candidate per `policy` and search it, classifying the result.
+/// Content matches stream to `sink` when given; its delivery failure is the
+/// only error.
 fn search_one_file<M: Matcher + Sync>(
 	fs: &BlockingFs,
 	worker: &mut SearchWorker,
@@ -1270,7 +1576,8 @@ fn search_one_file<M: Matcher + Sync>(
 	file: &pi_walker::FileCandidate,
 	file_params: SearchParams,
 	policy: ReadPolicy,
-) -> FileOutcome {
+	sink: Option<&dyn MatchSink>,
+) -> Result<FileOutcome> {
 	let read = match policy {
 		ReadPolicy::Full => {
 			read_file_bytes_with_size(fs, &file.path, file_size_hint(file.size), &mut worker.buffer)
@@ -1279,25 +1586,35 @@ fn search_one_file<M: Matcher + Sync>(
 	};
 	match read {
 		Ok(ReadFile::Read) => {},
-		Ok(ReadFile::Oversized) => return FileOutcome::Defer,
+		Ok(ReadFile::Oversized) => return Ok(FileOutcome::Defer),
 		Ok(ReadFile::Skipped) => {
-			return match policy {
+			return Ok(match policy {
 				ReadPolicy::Prefix => FileOutcome::SkippedOversized,
 				ReadPolicy::Full => FileOutcome::Skipped,
-			};
+			});
 		},
-		Err(_) => return FileOutcome::Skipped,
+		Err(_) => return Ok(FileOutcome::Skipped),
 	}
+	let search = match sink {
+		Some(sink) if file_params.mode == OutputMode::Content => run_streaming_search_in(
+			&mut worker.searcher,
+			matcher,
+			Haystack::Slice(&worker.buffer),
+			file_params,
+			sink,
+			&file.relative,
+		)?
+		.ok(),
+		_ => search_file_bytes(&mut worker.searcher, matcher, &worker.buffer, file_params),
+	};
 	// A searcher error counts as searched-with-no-matches, matching the prior
 	// behavior (the file was read and attempted).
-	let search = search_file_bytes(&mut worker.searcher, matcher, &worker.buffer, file_params)
-		.unwrap_or(SearchResultInternal {
-			matches:       Vec::new(),
-			match_count:   0,
-			collected:     0,
-			limit_reached: false,
-		});
-	FileOutcome::Searched(search)
+	Ok(FileOutcome::Searched(search.unwrap_or(SearchResultInternal {
+		matches:       Vec::new(),
+		match_count:   0,
+		collected:     0,
+		limit_reached: false,
+	})))
 }
 
 /// Search one candidate and fold its outcome into the shared [`PassState`].
@@ -1308,7 +1625,7 @@ fn handle_file<M: Matcher + Sync>(
 	file_params: SearchParams,
 	policy: ReadPolicy,
 	stop_after_matches: Option<u64>,
-	state: &PassState,
+	state: &PassState<'_>,
 	ct: &task::CancelToken,
 ) -> Result<()> {
 	ct.heartbeat()?;
@@ -1317,7 +1634,7 @@ fn handle_file<M: Matcher + Sync>(
 	{
 		return Ok(());
 	}
-	match search_one_file(&state.fs, worker, matcher, file, file_params, policy) {
+	match search_one_file(&state.fs, worker, matcher, file, file_params, policy, state.sink)? {
 		FileOutcome::Defer => {
 			state.deferred.lock().push(file.clone());
 		},
@@ -1327,7 +1644,18 @@ fn handle_file<M: Matcher + Sync>(
 		FileOutcome::Skipped => {},
 		FileOutcome::Searched(search) => {
 			state.files_searched.fetch_add(1, Ordering::Relaxed);
-			if search.match_count > 0 {
+			if search.match_count > 0
+				&& let Some(sink) = state.sink
+			{
+				state.streamed_files.fetch_add(1, Ordering::Relaxed);
+				state
+					.streamed_matches
+					.fetch_add(search.match_count, Ordering::Relaxed);
+				if search.limit_reached {
+					state.streamed_limit_reached.store(true, Ordering::Relaxed);
+				}
+				stream_file_entry(sink, file_params.mode, &file.relative, search.match_count)?;
+			} else if search.match_count > 0 {
 				let emitted_in_file = search.collected;
 				state.results.lock().push(FileSearchResult {
 					relative_path: file.relative.clone(),
@@ -1355,7 +1683,7 @@ fn run_pass<M: Matcher + Sync>(
 	policy: ReadPolicy,
 	parallel_allowed: bool,
 	stop_after_matches: Option<u64>,
-	state: &PassState,
+	state: &PassState<'_>,
 	ct: &task::CancelToken,
 ) -> Result<Vec<FileSearchResult>> {
 	if parallel_allowed && pi_walker::should_parallelize(candidates.len()) {
@@ -1495,7 +1823,7 @@ fn run_sequential_grep<M: Matcher + Sync>(
 	reason = "matches options structure of underlying walk candidates collector"
 )]
 fn run_parallel_streaming_grep<M: Matcher + Sync>(
-	fs: &BlockingFs,
+	state: &PassState<'_>,
 	search_path: &Path,
 	matcher: &M,
 	glob: Option<&str>,
@@ -1505,9 +1833,9 @@ fn run_parallel_streaming_grep<M: Matcher + Sync>(
 	use_gitignore: bool,
 	skip_node_modules: bool,
 	ct: &task::CancelToken,
-) -> Result<(Vec<FileSearchResult>, u64, u64)> {
+) -> Result<Vec<FileSearchResult>> {
 	let request = build_grep_walk_request(
-		fs,
+		&state.fs,
 		search_path,
 		glob,
 		include_hidden,
@@ -1516,7 +1844,6 @@ fn run_parallel_streaming_grep<M: Matcher + Sync>(
 		pi_walker::WalkOrder::Unordered,
 	)?;
 	let file_params = per_file_params(params);
-	let state = PassState::new(fs);
 
 	request
 		.for_each_file_candidate_parallel(
@@ -1527,7 +1854,7 @@ fn run_parallel_streaming_grep<M: Matcher + Sync>(
 					return Ok(pi_walker::ParallelWalkControl::Continue);
 				}
 				with_parallel_grep_searcher(file_params, |searcher| {
-					handle_file(file, searcher, matcher, file_params, ReadPolicy::Full, None, &state, ct)
+					handle_file(file, searcher, matcher, file_params, ReadPolicy::Full, None, state, ct)
 				})?;
 				Ok(pi_walker::ParallelWalkControl::Continue)
 			},
@@ -1541,15 +1868,11 @@ fn run_parallel_streaming_grep<M: Matcher + Sync>(
 	let deferred = std::mem::take(&mut *state.deferred.lock());
 	if !deferred.is_empty() {
 		let oversized =
-			run_pass(&deferred, matcher, file_params, ReadPolicy::Prefix, true, None, &state, ct)?;
+			run_pass(&deferred, matcher, file_params, ReadPolicy::Prefix, true, None, state, ct)?;
 		results.extend(oversized);
 	}
 
-	Ok((
-		results,
-		state.skipped_oversized.load(Ordering::Relaxed),
-		state.files_searched.load(Ordering::Relaxed),
-	))
+	Ok(results)
 }
 
 fn emitted_content_matches(results: &[FileSearchResult]) -> u64 {
@@ -1563,7 +1886,7 @@ fn flush_stream_window<M: Matcher + Sync>(
 	results: &mut Vec<FileSearchResult>,
 	matcher: &M,
 	file_params: SearchParams,
-	state: &PassState,
+	state: &PassState<'_>,
 	ct: &task::CancelToken,
 	stop_after_matches: u64,
 ) -> Result<bool> {
@@ -1697,18 +2020,26 @@ fn run_streaming_grep<M: Matcher + Sync>(
 ) -> Result<(Vec<FileSearchResult>, u64, u64)> {
 	let stop_after_matches = streaming_stop_after(params);
 	match stop_after_matches {
-		None => run_parallel_streaming_grep(
-			fs,
-			search_path,
-			matcher,
-			glob,
-			type_filter,
-			params,
-			include_hidden,
-			use_gitignore,
-			skip_node_modules,
-			ct,
-		),
+		None => {
+			let state = PassState::new(fs);
+			let results = run_parallel_streaming_grep(
+				&state,
+				search_path,
+				matcher,
+				glob,
+				type_filter,
+				params,
+				include_hidden,
+				use_gitignore,
+				skip_node_modules,
+				ct,
+			)?;
+			Ok((
+				results,
+				state.skipped_oversized.load(Ordering::Relaxed),
+				state.files_searched.load(Ordering::Relaxed),
+			))
+		},
 		Some(stop) if stop <= ORDERED_STREAMING_STOP_MAX_COUNT || pi_walker::walk_workers() <= 1 => {
 			run_sequential_grep(
 				fs,
@@ -1748,6 +2079,7 @@ fn push_count_match(matches: &mut Vec<GrepMatch>, path: String, match_count: u64
 		context_before: None,
 		context_after: None,
 		truncated: None,
+		column: None,
 		match_count: Some(crate::utils::clamp_u32(match_count)),
 	});
 }
@@ -1760,6 +2092,7 @@ fn push_file_match(matches: &mut Vec<GrepMatch>, path: String) {
 		context_before: None,
 		context_after: None,
 		truncated: None,
+		column: None,
 		match_count: None,
 	});
 }
@@ -1790,23 +2123,27 @@ fn aggregate_parallel_results(
 
 		match mode {
 			OutputMode::Content => {
-				let mut selected_matches = Vec::new();
-				for matched in result.matches {
-					if skipped < offset {
-						skipped += 1;
-						continue;
-					}
-					if let Some(max) = max_count
-						&& emitted >= max
-					{
-						limit_reached = true;
-						break;
-					}
-					selected_matches.push(matched);
-					emitted += 1;
+				let skipped_in_file = offset
+					.saturating_sub(skipped)
+					.min(result.matches.len() as u64) as usize;
+				skipped += skipped_in_file as u64;
+				let available = result.matches.len() - skipped_in_file;
+				let selected = max_count
+					.map_or(available, |max| max.saturating_sub(emitted).min(available as u64) as usize);
+				if selected < available {
+					limit_reached = true;
 				}
-				if !selected_matches.is_empty() {
-					push_content_matches(&mut matches, result.relative_path, selected_matches);
+				if selected > 0 {
+					push_content_matches(
+						&mut matches,
+						result.relative_path,
+						result
+							.matches
+							.into_iter()
+							.skip(skipped_in_file)
+							.take(selected),
+					);
+					emitted += selected as u64;
 				}
 				if result.limit_reached && skipped >= offset {
 					limit_reached = true;
@@ -1897,8 +2234,8 @@ fn search_sync(content: &[u8], options: SearchOptions) -> SearchResult {
 		multiline,
 	};
 	let result = match matcher {
-		CompiledMatcher::Rust(matcher) => run_search(&matcher, content, params),
-		CompiledMatcher::Pcre(matcher) => run_search(&matcher, content, params),
+		CompiledMatcher::Rust(matcher) => run_search(&matcher, Haystack::Slice(content), params),
+		CompiledMatcher::Pcre(matcher) => run_search(&matcher, Haystack::Slice(content), params),
 	};
 	let result = match result {
 		Ok(result) => result,
@@ -1950,6 +2287,12 @@ fn grep_sync_with_matcher<M: Matcher + Sync>(
 	let max_columns = options.max_columns;
 	let max_count = options.max_count.map(u64::from);
 	let offset = options.offset.unwrap_or(0) as u64;
+	let stream = options.stream.as_deref();
+	if stream.is_some() && (max_count.is_some() || offset != 0) {
+		return Err(Error::from_reason(
+			"Streaming grep (onMatches) does not support maxCount or offset",
+		));
+	}
 	let include_hidden = options.hidden.unwrap_or(true);
 	let use_gitignore = options.gitignore.unwrap_or(true);
 	let glob = options
@@ -1998,11 +2341,30 @@ fn grep_sync_with_matcher<M: Matcher + Sync>(
 			});
 		}
 
+		// Only directory walks cap the bytes read per file, where every worker
+		// would otherwise hold a whole large file at once. A file named on
+		// its own is streamed through the searcher's bounded buffer so all
+		// of it is searched. Multiline matching needs the whole file in
+		// memory, so it keeps the leading window and reports the file as
+		// partially searched.
 		let mut buffer = Vec::new();
-		let bytes = match read_file_bytes(fs, &search_path, &mut buffer) {
-			Ok(ReadFile::Read) => &buffer,
+		let haystack = match read_file_bytes(fs, &search_path, &mut buffer) {
+			Ok(ReadFile::Read) => Haystack::Slice(&buffer),
+			Ok(ReadFile::Oversized) if !multiline => match fs.open(&search_path) {
+				Ok(file) => Haystack::Reader(CancellableReader { file, ct: &ct }),
+				Err(_) => {
+					return Ok(GrepResult {
+						matches:            Vec::new(),
+						total_matches:      0,
+						files_with_matches: 0,
+						files_searched:     0,
+						limit_reached:      None,
+						skipped_oversized:  Some(1),
+					});
+				},
+			},
 			Ok(ReadFile::Oversized) => match read_file_prefix(fs, &search_path, &mut buffer) {
-				Ok(ReadFile::Read) => &buffer,
+				Ok(ReadFile::Read) => Haystack::Slice(&buffer),
 				_ => {
 					return Ok(GrepResult {
 						matches:            Vec::new(),
@@ -2025,11 +2387,32 @@ fn grep_sync_with_matcher<M: Matcher + Sync>(
 				});
 			},
 		};
+		// A streamed search fails once a line outgrows its buffer limit; say so,
+		// since the searcher's own message names only the allocation.
+		let streamed = matches!(haystack, Haystack::Reader(_));
+		let search_failed = |err: io::Error| {
+			let hint = if streamed {
+				format!(
+					" (a line longer than {} MiB cannot be searched; use read for this file)",
+					STREAM_LINE_LIMIT_BYTES / (1024 * 1024)
+				)
+			} else {
+				String::new()
+			};
+			Error::from_reason(format!("Search failed: {err}{hint}"))
+		};
 
 		if output_mode == OutputMode::FilesWithMatches && max_count.is_none() && offset == 0 {
-			let matched = matcher
-				.is_match(bytes.as_slice())
-				.map_err(|err| Error::from_reason(format!("Search failed: {err}")))?;
+			// One file either matches or not: report it once, as a directory walk
+			// does, whether its bytes are in memory or streamed.
+			let matched = match haystack {
+				Haystack::Slice(bytes) => matcher
+					.is_match(bytes)
+					.map_err(|err| io::Error::other(err.to_string())),
+				reader => run_search(matcher, reader, single_file_params(params))
+					.map(|search| search.match_count > 0),
+			}
+			.map_err(search_failed)?;
 			if !matched {
 				return Ok(GrepResult {
 					matches:            Vec::new(),
@@ -2042,7 +2425,7 @@ fn grep_sync_with_matcher<M: Matcher + Sync>(
 			}
 
 			let path_string = search_path.to_string_lossy().into_owned();
-			return Ok(GrepResult {
+			return hand_off(stream, GrepResult {
 				matches:            vec![GrepMatch {
 					path:           path_string,
 					line_number:    0,
@@ -2050,6 +2433,7 @@ fn grep_sync_with_matcher<M: Matcher + Sync>(
 					context_before: None,
 					context_after:  None,
 					truncated:      None,
+					column:         None,
 					match_count:    None,
 				}],
 				total_matches:      1,
@@ -2060,8 +2444,22 @@ fn grep_sync_with_matcher<M: Matcher + Sync>(
 			});
 		}
 
-		let search = run_search(matcher, bytes.as_slice(), params)
-			.map_err(|err| Error::from_reason(format!("Search failed: {err}")))?;
+		// A single explicit file is one file, so `max_count_per_file` applies to
+		// it exactly as it does inside a directory walk.
+		let params = single_file_params(params);
+		let path_string = search_path.to_string_lossy().into_owned();
+		let search = match stream {
+			Some(sink) if output_mode == OutputMode::Content => run_streaming_search_in(
+				&mut build_searcher_for_params(params),
+				matcher,
+				haystack,
+				params,
+				sink,
+				&path_string,
+			)?,
+			_ => run_search(matcher, haystack, params),
+		}
+		.map_err(search_failed)?;
 
 		if search.match_count == 0 {
 			return Ok(GrepResult {
@@ -2074,11 +2472,10 @@ fn grep_sync_with_matcher<M: Matcher + Sync>(
 			});
 		}
 
-		let path_string = search_path.to_string_lossy().into_owned();
 		let mut matches = Vec::new();
 		match output_mode {
 			OutputMode::Content => {
-				push_content_matches(&mut matches, path_string, search.matches);
+				push_content_matches(&mut matches, path_string, search.matches.into_iter());
 			},
 			OutputMode::Count => {
 				matches.push(GrepMatch {
@@ -2088,6 +2485,7 @@ fn grep_sync_with_matcher<M: Matcher + Sync>(
 					context_before: None,
 					context_after:  None,
 					truncated:      None,
+					column:         None,
 					match_count:    Some(crate::utils::clamp_u32(search.match_count)),
 				});
 			},
@@ -2099,6 +2497,7 @@ fn grep_sync_with_matcher<M: Matcher + Sync>(
 					context_before: None,
 					context_after:  None,
 					truncated:      None,
+					column:         None,
 					match_count:    None,
 				});
 			},
@@ -2107,7 +2506,7 @@ fn grep_sync_with_matcher<M: Matcher + Sync>(
 		let limit_reached =
 			search.limit_reached || max_count.is_some_and(|max| search.collected >= max);
 
-		return Ok(GrepResult {
+		return hand_off(stream, GrepResult {
 			matches,
 			total_matches: crate::utils::clamp_u32(search.match_count),
 			files_with_matches: 1,
@@ -2118,6 +2517,22 @@ fn grep_sync_with_matcher<M: Matcher + Sync>(
 	}
 
 	let mentions_node_modules = glob.is_some_and(|g| g.contains("node_modules"));
+	if let Some(sink) = stream {
+		let state = PassState::with_sink(fs, Some(sink));
+		run_parallel_streaming_grep(
+			&state,
+			&search_path,
+			matcher,
+			glob,
+			type_filter.as_ref(),
+			params,
+			include_hidden,
+			use_gitignore,
+			!mentions_node_modules,
+			&ct,
+		)?;
+		return Ok(state.streamed_result());
+	}
 	let results = run_streaming_grep(
 		fs,
 		&search_path,
@@ -2154,6 +2569,147 @@ fn grep_sync_with_matcher<M: Matcher + Sync>(
 			None
 		},
 	})
+}
+
+/// Streaming hands a single-file result's entries to `sink` instead of
+/// returning them.
+fn hand_off(sink: Option<&dyn MatchSink>, mut result: GrepResult) -> Result<GrepResult> {
+	if let Some(sink) = sink
+		&& !result.matches.is_empty()
+	{
+		sink.deliver(std::mem::take(&mut result.matches))?;
+	}
+	Ok(result)
+}
+
+#[derive(Default)]
+struct GrepStreamDelivery {
+	pending:   Vec<GrepMatch>,
+	in_flight: usize,
+	/// First callback error; preserved until the search rejects with it.
+	failure:   Option<Error>,
+}
+
+#[derive(Default)]
+struct GrepStreamShared {
+	delivery: Mutex<GrepStreamDelivery>,
+	ready:    Condvar,
+}
+
+/// [`MatchSink`] over `onMatches`, with cancellation-aware native backpressure.
+///
+/// Capacity is reserved before nonblocking N-API delivery and released when
+/// the JS callback returns. Successful completion drains every accepted batch;
+/// cancellation can stop both capacity waits and the final acknowledgement
+/// wait.
+struct JsMatchStream {
+	callback: GrepStreamCallback,
+	shared:   Arc<GrepStreamShared>,
+	cancel:   task::CancelToken,
+}
+
+impl JsMatchStream {
+	fn new(callback: GrepStreamCallback, cancel: task::CancelToken) -> Self {
+		Self { callback, shared: Arc::default(), cancel }
+	}
+
+	fn send(&self, batch: Vec<GrepMatch>) -> Result<()> {
+		{
+			let mut delivery = self.shared.delivery.lock();
+			loop {
+				self.cancel.heartbeat()?;
+				if delivery.failure.is_some() {
+					return Err(Error::from_reason("grep onMatches callback threw"));
+				}
+				if delivery.in_flight < GREP_STREAM_QUEUE {
+					delivery.in_flight += 1;
+					break;
+				}
+				self
+					.shared
+					.ready
+					.wait_for(&mut delivery, GREP_STREAM_CANCEL_POLL);
+			}
+		}
+
+		let shared = Arc::clone(&self.shared);
+		let status = self.callback.call_with_return_value(
+			batch,
+			ThreadsafeFunctionCallMode::NonBlocking,
+			move |returned: Result<UnknownReturnValue>, _: Env| {
+				let mut delivery = shared.delivery.lock();
+				if let Err(err) = returned {
+					delivery.failure.get_or_insert(err);
+				}
+				delivery.in_flight -= 1;
+				shared.ready.notify_all();
+				Ok(())
+			},
+		);
+		if status != Status::Ok {
+			let mut delivery = self.shared.delivery.lock();
+			delivery.in_flight -= 1;
+			self.shared.ready.notify_all();
+			return Err(Error::new(
+				status,
+				"grep onMatches callback is no longer callable".to_owned(),
+			));
+		}
+		Ok(())
+	}
+
+	fn drain(&self) -> Result<()> {
+		let mut delivery = self.shared.delivery.lock();
+		while delivery.in_flight > 0 {
+			self.cancel.heartbeat()?;
+			self
+				.shared
+				.ready
+				.wait_for(&mut delivery, GREP_STREAM_CANCEL_POLL);
+		}
+		Ok(())
+	}
+
+	/// Flush the coalesced tail and preserve the original callback error over
+	/// the generic failure used to stop the parallel scanner.
+	fn settle(&self, result: Result<GrepResult>) -> Result<GrepResult> {
+		let last = std::mem::take(&mut self.shared.delivery.lock().pending);
+		let result = result.and_then(|output| {
+			if !last.is_empty() {
+				self.send(last)?;
+			}
+			Ok(output)
+		});
+		let drained = self.drain();
+		let failure = self.shared.delivery.lock().failure.take();
+		match failure {
+			Some(err) => Err(err),
+			None => result.and_then(|output| drained.map(|()| output)),
+		}
+	}
+}
+
+impl MatchSink for JsMatchStream {
+	fn deliver(&self, mut matches: Vec<GrepMatch>) -> Result<()> {
+		self.cancel.heartbeat()?;
+		let ready = {
+			let mut delivery = self.shared.delivery.lock();
+			if delivery.failure.is_some() {
+				return Err(Error::from_reason("grep onMatches callback threw"));
+			}
+			let pending = &mut delivery.pending;
+			if pending.is_empty() {
+				*pending = matches;
+				return Ok(());
+			}
+			if pending.len() + matches.len() <= GREP_STREAM_BATCH {
+				pending.append(&mut matches);
+				return Ok(());
+			}
+			std::mem::replace(pending, matches)
+		};
+		self.send(ready)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -2234,16 +2790,18 @@ pub fn has_match(
 ///
 /// # Arguments
 /// - `options`: Pattern, path, filters, and output mode.
-/// - `on_match`: Optional callback invoked per match/result.
+/// - `on_match`: Optional callback invoked per returned match/result, after the
+///   search (never called when `options.onMatches` streams instead).
 ///
 /// # Returns
 /// Aggregated results across matching files.
 #[napi]
-pub fn grep(
+pub fn grep<'env>(
+	env: &'env Env,
 	options: GrepOptions<'_>,
 	#[napi(ts_arg_type = "((error: Error | null, match: GrepMatch) => void) | undefined | null")]
 	on_match: Option<ThreadsafeFunction<GrepMatch>>,
-) -> task::Promise<GrepResult> {
+) -> Result<PromiseRaw<'env, GrepResult>> {
 	let GrepOptions {
 		pattern,
 		path,
@@ -2265,30 +2823,42 @@ pub fn grep(
 		timeout_ms,
 		signal,
 		filesystem,
+		on_matches,
 	} = options;
 
-	let config = GrepConfig {
-		filesystem: ShellFilesystem::blocking(filesystem),
-		pattern,
-		path,
-		glob,
-		recursive,
-		type_filter: r#type,
-		ignore_case,
-		multiline,
-		hidden,
-		gitignore,
-		max_count,
-		max_count_per_file,
-		offset,
-		context_before,
-		context_after,
-		context,
-		max_columns,
-		mode,
-	};
 	let ct = task::CancelToken::new(timeout_ms, signal);
-	task::blocking("grep", ct, move |ct| grep_sync(config, on_match.as_ref(), ct))
+	let stream = on_matches.map(|callback| Arc::new(JsMatchStream::new(callback, ct.clone())));
+	let filesystem = ShellFilesystem::blocking(filesystem);
+	task::filesystem(env, "grep", ct, filesystem, move |filesystem, ct| {
+		let config = GrepConfig {
+			filesystem,
+			stream: stream
+				.clone()
+				.map(|stream| -> Arc<dyn MatchSink> { stream }),
+			pattern,
+			path,
+			glob,
+			recursive,
+			type_filter: r#type,
+			ignore_case,
+			multiline,
+			hidden,
+			gitignore,
+			max_count,
+			max_count_per_file,
+			offset,
+			context_before,
+			context_after,
+			context,
+			max_columns,
+			mode,
+		};
+		let result = grep_sync(config, on_match.as_ref(), ct);
+		match stream {
+			Some(stream) => stream.settle(result),
+			None => result,
+		}
+	})
 }
 
 #[cfg(test)]
@@ -2383,7 +2953,270 @@ mod tests {
 			mode:               None,
 			max_count_per_file: None,
 			filesystem:         BlockingFs::native(),
+			stream:             None,
 		}
+	}
+
+	#[cfg(unix)]
+	#[derive(Default)]
+	struct RecordingSink {
+		batches: parking_lot::Mutex<Vec<Vec<super::GrepMatch>>>,
+	}
+
+	#[cfg(unix)]
+	impl super::MatchSink for RecordingSink {
+		fn deliver(&self, matches: Vec<super::GrepMatch>) -> napi::Result<()> {
+			self.batches.lock().push(matches);
+			Ok(())
+		}
+	}
+
+	#[cfg(unix)]
+	struct FailingSink;
+
+	#[cfg(unix)]
+	impl super::MatchSink for FailingSink {
+		fn deliver(&self, _matches: Vec<super::GrepMatch>) -> napi::Result<()> {
+			Err(napi::Error::from_reason("consumer gone"))
+		}
+	}
+
+	/// `needle {i}` lines each followed by a `ctx {i}` line, dense enough to
+	/// span several streamed batches.
+	#[cfg(unix)]
+	fn write_dense_file(path: &Path, matches: usize) {
+		let content: String = (0..matches)
+			.map(|i| format!("needle {i}\nctx {i}\n"))
+			.collect();
+		write_file(path, &content);
+	}
+
+	fn search_long_line(pattern: &str, content: impl AsRef<[u8]>, multiline: bool) -> super::Match {
+		let result = super::search_sync(content.as_ref(), super::SearchOptions {
+			pattern:        pattern.to_string(),
+			ignore_case:    None,
+			multiline:      Some(multiline),
+			max_count:      None,
+			offset:         None,
+			context_before: None,
+			context_after:  None,
+			context:        None,
+			max_columns:    Some(512),
+			mode:           None,
+		});
+		assert_eq!(result.error, None);
+		result.matches.into_iter().next().expect("one match")
+	}
+
+	#[test]
+	fn long_line_match_past_the_budget_shows_a_window_around_it() {
+		let line = format!("{}deadline [s120]{}", "a".repeat(12_000), "b".repeat(2_400));
+		let found = search_long_line(r"deadline \[s120\]", &line, false);
+		assert_eq!(found.truncated, Some(true));
+		assert_eq!(found.column, Some(12_001));
+		assert!(found.line.len() <= 512, "window is {} bytes", found.line.len());
+		assert!(found.line.starts_with("...a"), "{}", found.line);
+		assert!(found.line.ends_with("b..."), "{}", found.line);
+		assert!(found.line.contains("deadline [s120]"), "{}", found.line);
+	}
+
+	#[test]
+	fn long_line_match_near_the_end_cuts_only_the_start() {
+		let line = format!("{}needle", "a".repeat(2_000));
+		let found = search_long_line("needle", &line, false);
+		assert_eq!(found.column, Some(2_001));
+		assert!(found.line.len() <= 512);
+		assert!(found.line.starts_with("...a"), "{}", found.line);
+		assert!(found.line.ends_with("aneedle"), "{}", found.line);
+	}
+
+	#[test]
+	fn long_line_match_inside_the_head_keeps_the_head() {
+		let line = format!("xx needle {}", "a".repeat(2_000));
+		let found = search_long_line("needle", &line, false);
+		assert_eq!(found.column, Some(4));
+		assert_eq!(found.line, format!("xx needle {}...", "a".repeat(499)));
+	}
+
+	#[test]
+	fn long_line_window_counts_columns_in_characters_and_cuts_on_boundaries() {
+		let line = format!("{}needle{}", "é".repeat(3_000), "é".repeat(3_000));
+		let found = search_long_line("needle", &line, false);
+		assert_eq!(found.column, Some(3_001));
+		assert!(found.line.len() <= 512);
+		assert!(found.line.starts_with("...é") && found.line.ends_with("é..."), "{}", found.line);
+		assert!(found.line.contains("needle"));
+	}
+
+	/// The window follows the match the searcher found, in the same context:
+	/// trailing text the display trims, the line terminator, and neighbouring
+	/// lines for look-around.
+	#[test]
+	fn long_line_window_follows_the_searchers_match() {
+		let pad = "a".repeat(12_000);
+		let cases = [
+			("trailing spaces", "needle +$", format!("{pad}needle   \n"), false),
+			("line terminator", r"needle\n", format!("{pad}needle\nnext\n"), true),
+			("look-ahead", r"needle(?=\nend)", format!("{pad}needle\nend\n"), true),
+			(
+				"look-ahead past 128 bytes",
+				r"needle(?=\nb{150}END)",
+				format!("{pad}needle\n{}END\n", "b".repeat(150)),
+				true,
+			),
+			(
+				"look-behind",
+				r"(?<=foo\na{12000})needle",
+				format!("foo\n{pad}needle{}\n", "b".repeat(100)),
+				true,
+			),
+		];
+		for (name, pattern, content, multiline) in cases {
+			let found = search_long_line(pattern, &content, multiline);
+			assert!(found.line.contains("needle"), "{name}: {}", found.line);
+			assert_eq!(found.column, Some(12_001), "{name}");
+		}
+	}
+
+	#[test]
+	fn long_line_window_maps_the_match_past_invalid_utf8() {
+		// The raw 0xFF byte decodes to U+FFFD (3 bytes): the window must follow
+		// the real `needle` match, not a replacement character in the decoded
+		// text.
+		let mut content = "a".repeat(12_000).into_bytes();
+		content.push(0xff);
+		content.extend(format!("{}needle{}", "c".repeat(2_000), "b".repeat(2_400)).into_bytes());
+		let found = search_long_line("\u{FFFD}|needle", &content, false);
+		assert!(found.line.contains("needle"), "{}", found.line);
+		assert_eq!(found.column, Some(14_002));
+	}
+
+	#[test]
+	fn long_line_window_shows_an_empty_match_at_the_end_of_input() {
+		let line = "a".repeat(5_000);
+		for (pattern, multiline) in
+			[("$", false), (r"\z", false), ("x|$", false), ("$", true), (r"\z", true)]
+		{
+			let found = search_long_line(pattern, &line, multiline);
+			assert_eq!(found.column, Some(5_001), "{pattern} multiline={multiline}");
+			assert!(found.line.starts_with("...a"), "{pattern}: {}", found.line);
+			assert!(found.line.ends_with('a'), "{pattern}: {}", found.line);
+		}
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn streaming_grep_delivers_bounded_batches_and_returns_only_counts() {
+		let dense_matches = super::GREP_STREAM_BATCH * 2 + 5;
+		let root = TempDirGuard::new();
+		write_dense_file(&root.path().join("dense.txt"), dense_matches);
+		write_file(&root.path().join("small.txt"), "needle x\nhay\n");
+		write_file(&root.path().join("none.txt"), "hay\n");
+
+		for (target, expected_files, expected_searched) in
+			[(root.path().to_path_buf(), 2, 3), (root.path().join("dense.txt"), 1, 1)]
+		{
+			let sink = std::sync::Arc::new(RecordingSink::default());
+			let mut config = base_grep_config(&target);
+			config.context_after = Some(1);
+			config.stream = Some(sink.clone());
+
+			let result = grep_sync(config, None, task::CancelToken::default())
+				.expect("streaming grep should succeed");
+
+			assert!(result.matches.is_empty(), "streamed matches must not be returned");
+			assert_eq!(result.files_with_matches, expected_files);
+			assert_eq!(result.files_searched, expected_searched);
+			assert_eq!(result.total_matches as usize, dense_matches + expected_files as usize - 1);
+
+			let batches = sink.batches.lock();
+			assert!(
+				batches
+					.iter()
+					.all(|batch| batch.len() <= super::GREP_STREAM_BATCH)
+			);
+			let dense: Vec<&super::GrepMatch> = batches
+				.iter()
+				.flatten()
+				.filter(|matched| matched.path.ends_with("dense.txt"))
+				.collect();
+			assert!(
+				batches
+					.iter()
+					.filter(|batch| batch[0].path.ends_with("dense.txt"))
+					.count()
+					>= 3,
+				"a dense file streams while it is searched, not as one batch",
+			);
+			assert_eq!(dense.len(), dense_matches);
+			for (i, matched) in dense.iter().enumerate() {
+				assert_eq!(matched.line, format!("needle {i}"));
+				let after = matched
+					.context_after
+					.as_deref()
+					.expect("after-context survives batching");
+				assert_eq!(after.len(), 1);
+				assert_eq!(after[0].line, format!("ctx {i}"));
+			}
+		}
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn streaming_count_mode_streams_one_entry_per_matching_file() {
+		let root = TempDirGuard::new();
+		write_file(&root.path().join("a.txt"), "needle\nneedle\n");
+		write_file(&root.path().join("b.txt"), "needle\n");
+		let sink = std::sync::Arc::new(RecordingSink::default());
+		let mut config = base_grep_config(root.path());
+		config.mode = Some(GrepOutputMode::Count);
+		config.stream = Some(sink.clone());
+
+		let result = grep_sync(config, None, task::CancelToken::default())
+			.expect("streaming count grep should succeed");
+
+		assert!(result.matches.is_empty());
+		assert_eq!(result.total_matches, 3);
+		let mut counts: Vec<(String, Option<u32>)> = sink
+			.batches
+			.lock()
+			.iter()
+			.flatten()
+			.map(|entry| (entry.path.clone(), entry.match_count))
+			.collect();
+		counts.sort();
+		assert_eq!(counts, [("a.txt".to_owned(), Some(2)), ("b.txt".to_owned(), Some(1))]);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn streaming_grep_stops_with_the_sink_error() {
+		let root = TempDirGuard::new();
+		write_dense_file(&root.path().join("dense.txt"), super::GREP_STREAM_BATCH * 2);
+		let mut config = base_grep_config(root.path());
+		config.stream = Some(std::sync::Arc::new(FailingSink));
+
+		let Err(err) = grep_sync(config, None, task::CancelToken::default()) else {
+			panic!("a failed delivery must fail the search");
+		};
+
+		assert!(err.reason.contains("consumer gone"), "reason = {}", err.reason);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn streaming_grep_rejects_global_limits() {
+		let root = TempDirGuard::new();
+		write_file(&root.path().join("a.txt"), "needle\n");
+		let mut config = base_grep_config(root.path());
+		config.max_count = Some(1);
+		config.stream = Some(std::sync::Arc::new(RecordingSink::default()));
+
+		let Err(err) = grep_sync(config, None, task::CancelToken::default()) else {
+			panic!("streaming cannot honor a global maxCount");
+		};
+
+		assert!(err.reason.contains("maxCount"), "reason = {}", err.reason);
 	}
 
 	#[test]
@@ -2633,6 +3466,35 @@ mod tests {
 
 	#[cfg(unix)]
 	#[test]
+	fn grep_glob_naming_directories_searches_their_files() {
+		let root = TempDirGuard::new();
+		write_file(&root.path().join("backend/auth/a.ts"), "needle auth\n");
+		write_file(&root.path().join("frontend/src/main.tsx"), "needle main\n");
+		write_file(&root.path().join("frontend/src/deep/x.tsx"), "needle deep\n");
+		write_file(&root.path().join("other/z.ts"), "needle other\n");
+
+		for (glob, expected) in [
+			(
+				"{backend/auth,frontend/src}",
+				&["backend/auth/a.ts", "frontend/src/deep/x.tsx", "frontend/src/main.tsx"][..],
+			),
+			("frontend/sr?", &["frontend/src/deep/x.tsx", "frontend/src/main.tsx"][..]),
+			("frontend/sr**", &["frontend/src/deep/x.tsx", "frontend/src/main.tsx"][..]),
+			("frontend/src/{main.tsx,App.tsx}", &["frontend/src/main.tsx"][..]),
+		] {
+			let mut config = base_grep_config(root.path());
+			config.glob = Some(glob.to_string());
+			config.recursive = Some(false);
+			let result = grep_sync(config, None, task::CancelToken::default())
+				.expect("directory glob grep should succeed");
+			let mut paths: Vec<&str> = result.matches.iter().map(|m| m.path.as_str()).collect();
+			paths.sort_unstable();
+			assert_eq!(paths, expected, "glob {glob}");
+		}
+	}
+
+	#[cfg(unix)]
+	#[test]
 	fn grep_files_with_matches_counts_all_searched_files_when_none_match() {
 		let root = TempDirGuard::new();
 		write_file(&root.path().join("a.txt"), "haystack a\n");
@@ -2677,6 +3539,44 @@ mod tests {
 
 	#[cfg(unix)]
 	#[test]
+	fn grep_content_pages_preserve_context_and_totals_across_files() {
+		let root = TempDirGuard::new();
+		write_file(&root.path().join("a.txt"), "before a\nneedle a\nafter a\n");
+		write_file(&root.path().join("b.txt"), "before b\nneedle b\nafter b\n");
+		// Nonzero offsets exercise aggregation after the complete directory scan.
+		for (offset, max_count, expected, limited) in [
+			(1, Some(0), None, true),
+			(1, Some(1), Some("b.txt"), true),
+			(1, Some(2), Some("b.txt"), false),
+			(2, Some(1), None, false),
+			(3, None, None, false),
+		] {
+			let mut config = base_grep_config(root.path());
+			config.offset = Some(offset);
+			config.max_count = max_count;
+			config.context = Some(1);
+			let result = grep_sync(config, None, task::CancelToken::default())
+				.expect("paginated content search succeeds");
+			assert_eq!(result.total_matches, 2);
+			assert_eq!(result.files_with_matches, 2);
+			assert_eq!(result.files_searched, 2);
+			assert_eq!(result.limit_reached, limited.then_some(true));
+			assert_eq!(result.matches.len(), usize::from(expected.is_some()));
+			if let Some(path) = expected {
+				let matched = &result.matches[0];
+				assert_eq!(matched.path, path);
+				assert_eq!(matched.line_number, 2);
+				assert_eq!(matched.line, "needle b");
+				let before = matched.context_before.as_ref().expect("before context");
+				let after = matched.context_after.as_ref().expect("after context");
+				assert_eq!((before[0].line_number, before[0].line.as_str()), (1, "before b"));
+				assert_eq!((after[0].line_number, after[0].line.as_str()), (3, "after b"));
+			}
+		}
+	}
+
+	#[cfg(unix)]
+	#[test]
 	fn grep_count_mode_limit_applies_to_matches_not_files() {
 		let root = TempDirGuard::new();
 		write_file(&root.path().join("a.txt"), "needle a1\nneedle a2\n");
@@ -2695,6 +3595,62 @@ mod tests {
 		assert_eq!(result.matches.len(), 1);
 		assert_eq!(result.matches[0].path, "a.txt");
 		assert_eq!(result.matches[0].match_count, Some(2));
+	}
+
+	/// A single-file Count search reports every match, as a directory search
+	/// does.
+	///
+	/// The direct-file branch once passed the caller's `max_count` to
+	/// `MatchCollector`, so `grep({ path: file, mode: Count, maxCount: 2 })` on
+	/// a file with 5 matches stopped at the third match and reported
+	/// `matchCount: 3`, the max+1 value from the early `Ok(false)`.
+	///
+	/// Self-contained on purpose: the shared `write_file` and `base_grep_config`
+	/// helpers are `#[cfg(unix)]`, so this case builds its own file and config
+	/// and therefore runs on every platform.
+	#[test]
+	fn grep_single_file_count_mode_reports_every_match() {
+		let dir = std::env::temp_dir().join(format!(
+			"omp-grep-count-{}-{:?}",
+			std::process::id(),
+			std::thread::current().id()
+		));
+		std::fs::create_dir_all(&dir).expect("create temp dir");
+		let file = dir.join("only.txt");
+		std::fs::write(&file, "needle 1\nneedle 2\nneedle 3\nneedle 4\nneedle 5\n")
+			.expect("write test file");
+
+		let config = super::GrepConfig {
+			pattern:            "needle".to_string(),
+			path:               file.to_string_lossy().into_owned(),
+			glob:               None,
+			recursive:          None,
+			type_filter:        None,
+			ignore_case:        None,
+			multiline:          None,
+			hidden:             None,
+			gitignore:          Some(false),
+			max_count:          Some(2),
+			offset:             None,
+			context_before:     None,
+			context_after:      None,
+			context:            None,
+			max_columns:        None,
+			mode:               Some(super::GrepOutputMode::Count),
+			max_count_per_file: None,
+			filesystem:         super::BlockingFs::native(),
+			stream:             None,
+		};
+
+		let result = super::grep_sync(config, None, crate::task::CancelToken::default())
+			.expect("single-file grep should succeed");
+		let _ = std::fs::remove_dir_all(&dir);
+
+		assert_eq!(
+			result.matches[0].match_count,
+			Some(5),
+			"count mode must report every match in a single file, not the content cap"
+		);
 	}
 
 	#[cfg(unix)]
@@ -2774,6 +3730,82 @@ mod tests {
 		assert_eq!(paths, ["a.txt", "a.txt", "z.txt"], "hot file must not starve later files");
 		assert_eq!(result.files_with_matches, 2);
 		assert_eq!(result.limit_reached, Some(true));
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn single_file_target_honours_max_count_per_file() {
+		// The cap used to reach only `per_file_params`, whose callers are all
+		// directory walks, so passing one explicit file silently dropped it.
+		let root = TempDirGuard::new();
+		let hot = root.path().join("hot.txt");
+		write_file(&hot, "needle 1\nneedle 2\nneedle 3\nneedle 4\nneedle 5\n");
+
+		let mut config = base_grep_config(&hot);
+		config.max_count = Some(4);
+		config.max_count_per_file = Some(2);
+
+		let result = grep_sync(config, None, task::CancelToken::default())
+			.expect("single-file grep should succeed");
+
+		assert_eq!(result.matches.len(), 2, "per-file cap must apply to a single file");
+		assert_eq!(result.files_with_matches, 1);
+		assert_eq!(result.limit_reached, Some(true));
+		assert_eq!(
+			result.total_matches, 3,
+			"the per-file cap stops the scan at the match after the last collected one",
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn files_with_matches_reports_a_streamed_file_once() {
+		// A file past the in-memory window is streamed; file mode must still
+		// count it as one matching file, as it does a smaller one.
+		let root = TempDirGuard::new();
+		let big = root.path().join("big.txt");
+		write_oversized_file(&big, "needle 1\nneedle 2\n");
+
+		let mut config = base_grep_config(&big);
+		config.mode = Some(GrepOutputMode::FilesWithMatches);
+
+		let result = grep_sync(config, None, task::CancelToken::default())
+			.expect("single-file grep should succeed");
+
+		assert_eq!(result.matches.len(), 1);
+		assert_eq!(result.total_matches, 1);
+		assert_eq!(result.files_with_matches, 1);
+		assert_eq!(result.limit_reached, None);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn single_file_target_keeps_offset_when_max_count_per_file_applies() {
+		// `per_file_params` zeroes the offset because each directory entry
+		// applies it fresh. A single file applies it once, so folding the cap in
+		// must not drop it — otherwise every paginated single-file search
+		// silently shifts its window.
+		let root = TempDirGuard::new();
+		let hot = root.path().join("hot.txt");
+		write_file(&hot, "needle 1\nneedle 2\nneedle 3\nneedle 4\nneedle 5\n");
+
+		let mut config = base_grep_config(&hot);
+		config.max_count = Some(10);
+		config.max_count_per_file = Some(2);
+		config.offset = Some(2);
+
+		let result =
+			grep_sync(config, None, task::CancelToken::default()).expect("offset grep should succeed");
+
+		assert_eq!(
+			result
+				.matches
+				.iter()
+				.map(|m| m.line_number)
+				.collect::<Vec<_>>(),
+			vec![3, 4],
+			"offset applies first, then the per-file cap bounds collection",
+		);
 	}
 
 	#[cfg(unix)]

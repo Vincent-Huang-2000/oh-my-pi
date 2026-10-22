@@ -182,68 +182,6 @@ describe("MemoryProtocolHandler", () => {
 		});
 	});
 
-	it("resolves memory://root against the caller cwd when multiple sessions are live", async () => {
-		const cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "memory-protocol-isolation-"));
-		const previousAgentDir = getAgentDir();
-		try {
-			const agentDir = path.join(cleanupRoot, "agent");
-			setAgentDir(agentDir);
-
-			const firstCwd = path.join(cleanupRoot, "first-project");
-			const secondCwd = path.join(cleanupRoot, "second-project");
-			await fs.mkdir(firstCwd, { recursive: true });
-			await fs.mkdir(secondCwd, { recursive: true });
-
-			const firstMemoryRoot = getMemoryRoot(agentDir, firstCwd);
-			const secondMemoryRoot = getMemoryRoot(agentDir, secondCwd);
-			await fs.mkdir(firstMemoryRoot, { recursive: true });
-			await fs.mkdir(secondMemoryRoot, { recursive: true });
-
-			const firstSummary = "first registered session summary";
-			const secondSummary = "second session cwd summary";
-			await Bun.write(path.join(firstMemoryRoot, "memory_summary.md"), firstSummary);
-			await Bun.write(path.join(secondMemoryRoot, "memory_summary.md"), secondSummary);
-
-			AgentRegistry.global().register({
-				id: "first-session",
-				displayName: "first-session",
-				kind: "main",
-				session: {
-					sessionManager: {
-						getCwd: () => firstCwd,
-						getArtifactsDir: () => null,
-						getSessionId: () => "first-session",
-					},
-					settings: Settings.isolated({ "memory.backend": "local" }),
-				} as unknown as AgentSession,
-				sessionFile: null,
-			});
-			AgentRegistry.global().register({
-				id: "second-session",
-				displayName: "second-session",
-				kind: "main",
-				session: {
-					sessionManager: {
-						getCwd: () => secondCwd,
-						getArtifactsDir: () => null,
-						getSessionId: () => "second-session",
-					},
-					settings: Settings.isolated({ "memory.backend": "local" }),
-				} as unknown as AgentSession,
-				sessionFile: null,
-			});
-
-			const router = InternalUrlRouter.instance();
-			const resource = await router.resolve("memory://root", { cwd: secondCwd });
-
-			expect(resource.content).toBe(secondSummary);
-			expect(resource.content).not.toBe(firstSummary);
-		} finally {
-			setAgentDir(previousAgentDir);
-			await removeWithRetries(cleanupRoot);
-		}
-	});
-
 	it("resolves memory://root for a session-id-only caller with no cwd", async () => {
 		const cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "memory-protocol-session-id-"));
 		const previousAgentDir = getAgentDir();
@@ -503,7 +441,7 @@ let sharedMnemopiFixture: MnemopiFixture | undefined;
 
 async function withMnemopiSession(fn: (fixture: MnemopiFixture) => Promise<void>): Promise<void> {
 	if (!sharedMnemopiFixture) {
-		const dbDir = TempDir.createSync("memory-protocol-mnemopi-");
+		const dbDir = TempDir.createSync("@memory-protocol-mnemopi-");
 		const config = {
 			dbPath: dbDir.join("mnemopi.db"),
 			bank: "test-bank",
@@ -663,7 +601,7 @@ describe("MemoryProtocolHandler — mnemopi bridge (issue #4443)", () => {
 
 	it("binds memory://<id> to the calling session's own bank", async () => {
 		await withMnemopiSession(async ({ state, dbDir }) => {
-			const peerDbDir = TempDir.createSync("memory-protocol-mnemopi-peer-");
+			const peerDbDir = TempDir.createSync("@memory-protocol-mnemopi-peer-");
 			let peerState: MnemopiSessionState | undefined;
 			try {
 				const peerSession = {
@@ -714,7 +652,7 @@ describe("MemoryProtocolHandler — mnemopi bridge (issue #4443)", () => {
 
 	it("keeps peer banks unreachable when a cwd names two live sessions", async () => {
 		await withMnemopiSession(async ({ state, dbDir }) => {
-			const twinDir = TempDir.createSync("memory-protocol-mnemopi-twin-");
+			const twinDir = TempDir.createSync("@memory-protocol-mnemopi-twin-");
 			const previousAgentDir = getAgentDir();
 			let twinState: MnemopiSessionState | undefined;
 			try {

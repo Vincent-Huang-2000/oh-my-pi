@@ -1,11 +1,26 @@
 /**
  * Render a code or markdown cell with optional output section.
  */
+import type { TspSpan } from "@oh-my-pi/pi-wire";
 import { Markdown } from "../components/markdown";
+import { styledSpans } from "../native/spans";
+import { code, md, span } from "../native/describe";
+import type { NativeNode } from "../native/node";
 import { getMarkdownTheme, highlightCode, type Theme } from "../theme/theme";
 import { formatDuration, formatExpandHint, formatMoreItems, formatStatusIcon, replaceTabs } from "./render-utils";
-import { outputBlockContentWidth, renderOutputBlock } from "./output-block";
-import { formatOutputPaneLines, splitTerminalOutputLines, styleToolOutputLine } from "./output-pane";
+import { wrapPrefixedLine } from "./hanging-wrap";
+import {
+	describeOutputBlock,
+	type NativeOutputBlockSection,
+	outputBlockContentWidth,
+	renderOutputBlock,
+} from "./output-block";
+import {
+	describeOutputLines,
+	formatOutputPaneLines,
+	splitTerminalOutputLines,
+	styleToolOutputLine,
+} from "./output-pane";
 import type { State } from "./types";
 
 /** Content and display limits for a code preview with optional output. */
@@ -153,6 +168,7 @@ export function renderCodeCell(options: CodeCellOptions, theme: Theme): string[]
 		}
 	}
 
+	const numberedCodeLines: string[] = [];
 	if (lineNumberWidth > 0 && visibleLineNumbers) {
 		for (let i = 0; i < codeLines.length; i++) {
 			const lineNum = visibleLineNumbers[i];
@@ -160,10 +176,14 @@ export function renderCodeCell(options: CodeCellOptions, theme: Theme): string[]
 				lineNum !== null && lineNum !== undefined
 					? String(lineNum).padStart(lineNumberWidth, " ")
 					: " ".repeat(lineNumberWidth);
-			codeLines[i] = theme.fg("dim", `${gutter} `) + codeLines[i];
+			const prefix = theme.fg("dim", `${gutter} `);
+			numberedCodeLines.push(
+				...wrapPrefixedLine(prefix, " ".repeat(lineNumberWidth + 1), codeLines[i]!, outputBlockContentWidth(width)),
+			);
 		}
 	}
 
+	const displayCodeLines = lineNumberWidth > 0 ? numberedCodeLines : codeLines;
 	if (hiddenCodeLines > 0) {
 		const hint = formatExpandHint(theme, expanded, hiddenCodeLines > 0);
 		const gutterPad = lineNumberWidth > 0 ? " ".repeat(lineNumberWidth + 1) : "";
@@ -171,21 +191,115 @@ export function renderCodeCell(options: CodeCellOptions, theme: Theme): string[]
 			// Earlier rows scrolled above the live tail window — mark them on top so
 			// the newest streamed line stays pinned to the bottom of the box.
 			const earlier = `… ${hiddenCodeLines} earlier line${hiddenCodeLines === 1 ? "" : "s"}${hint ? ` ${hint}` : ""}`;
-			codeLines.unshift(theme.fg("dim", gutterPad + earlier));
+			displayCodeLines.unshift(theme.fg("dim", gutterPad + earlier));
 		} else {
 			const moreLine = `${formatMoreItems(hiddenCodeLines, "line")}${hint ? ` ${hint}` : ""}`;
-			codeLines.push(theme.fg("dim", gutterPad + moreLine));
+			displayCodeLines.push(theme.fg("dim", gutterPad + moreLine));
 		}
 	}
 
 	const outputLines = renderCellOutput(output, expanded, outputMaxLines, theme);
 
-	const sections: Array<{ label?: string; lines: readonly string[] }> = [{ lines: codeLines }];
+	const sections: Array<{ label?: string; lines: readonly string[] }> = [{ lines: displayCodeLines }];
 	if (outputLines.length > 0) {
 		sections.push({ label: theme.fg("toolTitle", "Output"), lines: outputLines });
 	}
 
 	return renderOutputBlock({ header: title, headerMeta: meta, state, sections, width }, theme);
+}
+
+type CellHeaderOptions = Pick<CodeCellOptions, "index" | "total" | "title" | "duration" | "language" | "showLanguage">;
+
+/** Header spans for a native cell: language icon, `[i/n]`, title. Status is the card's chip. */
+function describeHeader(options: CellHeaderOptions, theme: Theme): { head: TspSpan[]; meta?: TspSpan[] } {
+	const head: TspSpan[] = [];
+	const push = (part: readonly TspSpan[]): void => {
+		if (head.length > 0) head.push(span(" "));
+		head.push(...part);
+	};
+	if (options.showLanguage && options.language) {
+		const icon = theme.getLangIconStyled(options.language);
+		if (icon) push(styledSpans(icon));
+	}
+	if (options.index !== undefined && options.total !== undefined && options.total > 1) {
+		push([span(`[${options.index + 1}/${options.total}]`, "accent")]);
+	}
+	if (options.title) push([span(options.title, "toolTitle")]);
+	if (head.length === 0) head.push(span("Code", "toolTitle"));
+	return {
+		head,
+		meta: options.duration === undefined ? undefined : [span(formatDuration(options.duration), "dim")],
+	};
+}
+
+function describeCellOutput(
+	output: string | undefined,
+	expanded: boolean,
+	outputMaxLines: number,
+): NativeOutputBlockSection | undefined {
+	if (!output?.trim()) return undefined;
+	return {
+		label: [span("Output", "toolTitle")],
+		key: "output",
+		body: [describeOutputLines(splitTerminalOutputLines(output), { expanded, collapsedMaxLines: outputMaxLines })],
+	};
+}
+
+/**
+ * The native form of {@link renderCodeCell}: a collapsible `card` holding a
+ * `code` node (numbered from `codeStartLine`, or the first explicit line
+ * number) and an `ansi` output section. The collapsed code clamp is the
+ * card preview; highlighting and gutters are the terminal's.
+ */
+export function describeCodeCell(options: Omit<CodeCellOptions, "width">, theme: Theme): NativeNode {
+	const { expanded = false, outputMaxLines = 6, codeMaxLines = 12 } = options;
+	const { head, meta } = describeHeader(options, theme);
+	const start = options.codeStartLine ?? options.codeLineNumbers?.find((line): line is number => line != null);
+	const sections: NativeOutputBlockSection[] = [
+		{
+			key: "code",
+			body: [
+				code(options.code ?? "", {
+					lang: options.language,
+					start,
+					numbers: start !== undefined || undefined,
+					wrap: true,
+				}),
+			],
+		},
+	];
+	const output = describeCellOutput(options.output, expanded, outputMaxLines);
+	if (output) sections.push(output);
+	return describeOutputBlock({
+		head,
+		meta,
+		state: getState(options.status),
+		role: "omp.cell.code",
+		sections,
+		collapsible: true,
+		collapsed: !expanded,
+		preview: { lines: codeMaxLines },
+	});
+}
+
+/** The native form of {@link renderMarkdownCell}: a collapsible `card` holding `md` source and optional output. */
+export function describeMarkdownCell(options: Omit<MarkdownCellOptions, "width">, theme: Theme): NativeNode {
+	const { expanded = false, outputMaxLines = 6, contentMaxLines = 12 } = options;
+	const { head, meta } = describeHeader(options, theme);
+	const sections: NativeOutputBlockSection[] = [];
+	if (options.content.trim()) sections.push({ key: "content", body: [md(options.content)] });
+	const output = describeCellOutput(options.output, expanded, outputMaxLines);
+	if (output) sections.push(output);
+	return describeOutputBlock({
+		head,
+		meta,
+		state: getState(options.status),
+		role: "omp.cell.markdown",
+		sections,
+		collapsible: true,
+		collapsed: !expanded,
+		preview: { lines: contentMaxLines },
+	});
 }
 
 /** Content and display limits for a Markdown preview with optional output. */

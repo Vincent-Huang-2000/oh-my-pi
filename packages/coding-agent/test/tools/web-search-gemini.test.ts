@@ -4,7 +4,7 @@ import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { AuthStorage, type FetchImpl, type Model, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { serializeCloudflareAiGatewayCredential } from "@oh-my-pi/pi-catalog/wire/cloudflare-ai-gateway";
+import { serializeCloudflareCredential } from "@oh-my-pi/pi-catalog/wire/cloudflare";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { GeminiProvider, searchGemini } from "@oh-my-pi/pi-coding-agent/web/search/providers/gemini";
 
@@ -149,7 +149,7 @@ describe("searchGemini tools serialization", () => {
 			.mockResolvedValueOnce({ apiKey: "initial-gemini-key" })
 			.mockResolvedValueOnce({ apiKey: "refreshed-gemini-key" })
 			.mockResolvedValueOnce({ apiKey: "rotated-gemini-key" });
-		const rotateSpy = vi.spyOn(apiKeyAuthStorage.limits, "rotate").mockResolvedValue(true);
+		const rotateSpy = vi.spyOn(apiKeyAuthStorage.limits, "rotate").mockResolvedValue({ switched: true });
 		const fetchMock: FetchImpl = (url, init) => {
 			requestCount += 1;
 			requestUrls.push(String(url));
@@ -183,7 +183,7 @@ describe("searchGemini tools serialization", () => {
 		const gatewayAuthStorage = new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")));
 		gatewayAuthStorage.keys.setRuntime(
 			"cloudflare-ai-gateway",
-			serializeCloudflareAiGatewayCredential("test-cloudflare-key", "account", "gateway"),
+			serializeCloudflareCredential({ token: "test-cloudflare-key", accountId: "account", gatewayId: "gateway" }),
 		);
 		const gatewayRegistry = new ModelRegistry(gatewayAuthStorage);
 		const gatewayModel = geminiDeveloperModel(
@@ -412,5 +412,16 @@ describe("searchGemini tools serialization", () => {
 				fetch: mockGeminiFetch("data: {}\n\n"),
 			}),
 		).rejects.toThrow("Gemini API returned an empty grounded response");
+	});
+
+	it("does not tag Antigravity search requests with the requestType that draws false 429 quota errors", async () => {
+		const fetchMock = mockGeminiFetch();
+		await searchGemini({
+			...makeParams("antigravity search", getBundledModel("google-antigravity", "gemini-3.8-flash")),
+			fetch: fetchMock,
+		});
+
+		expect(capturedRequest?.body?.userAgent).toBe("antigravity");
+		expect(capturedRequest?.body?.requestType).toBeUndefined();
 	});
 });

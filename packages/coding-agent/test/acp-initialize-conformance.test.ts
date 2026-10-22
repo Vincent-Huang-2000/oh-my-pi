@@ -232,7 +232,6 @@ describe("ACP initialize conformance", () => {
 		const pkg = (await Bun.file(pkgPath).json()) as { version: string };
 		expect(response.agentInfo).toEqual(
 			expect.objectContaining({
-				name: "oh-my-pi",
 				title: "omp",
 				version: VERSION,
 			}),
@@ -257,5 +256,15 @@ describe("ACP initialize conformance", () => {
 				}),
 			}),
 		);
+	});
+
+	it("advertises the steering extension via top-level _meta", async () => {
+		const agent = await createAgent();
+		const response = await agent.initialize(buildInitializeRequest());
+		expectAcpStructure(arkInitializeResponse, response);
+		// Top-level `_meta` (sibling of `agentCapabilities`) is the
+		// claude-agent-acp / codex-acp advertisement that gates clients'
+		// `_session/steering` calls (agent-shell, spec proposal `session/inject`).
+		expect(response._meta).toEqual({ steering: { supported: true } });
 	});
 });

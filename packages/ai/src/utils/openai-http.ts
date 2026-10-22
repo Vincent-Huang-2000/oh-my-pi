@@ -68,10 +68,18 @@ export interface OpenAIStreamRequestInit {
 	body: unknown;
 	signal: AbortSignal;
 	fetch?: FetchImpl;
+	/** Override the default transport attempt budget for this request. */
+	maxAttempts?: number;
 	/** Optional caller-specific gate composed with shared transport retry exclusions. */
 	shouldRetryResponse?: (response: Response, bodyText: string) => boolean | Promise<boolean>;
-	/** Raw wire-frame observer (`onSseEvent` debug pipeline). */
+	/**
+	 * Raw wire-frame observer (`onSseEvent` debug pipeline). Leave it unset
+	 * when no diagnostic listener exists: any observer turns on per-line raw
+	 * capture for every frame.
+	 */
 	onSseEvent?: SseEventObserver;
+	/** Called when the stream ends on the OpenAI `[DONE]` sentinel; independent of {@link onSseEvent}. */
+	onDoneSentinel?: () => void;
 }
 
 export interface OpenAIStreamHandle<TEvent> {
@@ -90,24 +98,31 @@ export interface OpenAIStreamHandle<TEvent> {
  * watchdog timers and abort-reason bookkeeping.
  */
 export async function postOpenAIStream<TEvent>(init: OpenAIStreamRequestInit): Promise<OpenAIStreamHandle<TEvent>> {
-	const response = await fetchWithRetry(init.url, {
-		method: "POST",
-		headers: { "Content-Type": "application/json", Accept: "text/event-stream", ...init.headers },
-		body: JSON.stringify(init.body),
-		signal: init.signal,
-		fetch: init.fetch,
-		maxAttempts: DEFAULT_MAX_ATTEMPTS,
-		// A proxy concurrency-admission 429 (`rate_limit_type: max_parallel_requests`)
-		// surfaces immediately instead of being slept-and-retried here; session
-		// recovery owns its backoff/fallback (issue #8854).
-		shouldRetryResponse: async (response, bodyText) =>
-			!isConcurrencyAdmissionRejection(response, bodyText) &&
-			(init.shouldRetryResponse === undefined || (await init.shouldRetryResponse(response, bodyText))),
-		// Bun's native fetch enforces a hard ~300s pre-response timeout (issue #2422).
-		// Cold large-context streams legitimately exceed it; the caller's
-		// `firstEventTimeoutMs`/`AbortSignal` already govern stuck requests.
-		timeout: false,
-	});
+	let response: Response;
+	try {
+		response = await fetchWithRetry(init.url, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", Accept: "text/event-stream", ...init.headers },
+			body: JSON.stringify(init.body),
+			signal: init.signal,
+			fetch: init.fetch,
+			maxAttempts: init.maxAttempts ?? DEFAULT_MAX_ATTEMPTS,
+			// A proxy concurrency-admission 429 (`rate_limit_type: max_parallel_requests`)
+			// surfaces immediately instead of being slept-and-retried here; session
+			// recovery owns its backoff/fallback (issue #8854).
+			shouldRetryResponse: async (response, bodyText) =>
+				!isConcurrencyAdmissionRejection(response, bodyText) &&
+				(init.shouldRetryResponse === undefined || (await init.shouldRetryResponse(response, bodyText))),
+			// Bun's native fetch enforces a hard ~300s pre-response timeout (issue #2422).
+			// Cold large-context streams legitimately exceed it; the caller's
+			// `firstEventTimeoutMs`/`AbortSignal` already govern stuck requests.
+			timeout: false,
+		});
+	} catch (error) {
+		// Transport rejection after the retry budget: name the host and the cause
+		// instead of surfacing the runtime's bare `getaddrinfo …` text.
+		throw AIError.networkFailureError(error, init.url);
+	}
 	if (!response.ok) {
 		throw await captureOpenAIHttpError(response);
 	}
@@ -117,7 +132,7 @@ export async function postOpenAIStream<TEvent>(init: OpenAIStreamRequestInit): P
 		});
 	}
 	return {
-		events: decodeStream<TEvent>(response.body, init.signal, init.onSseEvent),
+		events: decodeStream<TEvent>(response.body, init.signal, init.onSseEvent, init.onDoneSentinel),
 		response,
 		requestId: response.headers.get("x-request-id"),
 	};
@@ -140,8 +155,9 @@ async function* decodeStream<TEvent>(
 	body: ReadableStream<Uint8Array>,
 	signal: AbortSignal | undefined,
 	onSseEvent: SseEventObserver | undefined,
+	onDoneSentinel: (() => void) | undefined,
 ): AsyncGenerator<TEvent> {
-	for await (const frame of readSseJsonOrText<TEvent>(body, signal, onSseEvent)) {
+	for await (const frame of readSseJsonOrText<TEvent>(body, signal, onSseEvent, onDoneSentinel)) {
 		if (typeof frame === "string") {
 			const inBand = AIError.createInBandProviderErrorFromText(frame);
 			if (inBand) throw inBand;

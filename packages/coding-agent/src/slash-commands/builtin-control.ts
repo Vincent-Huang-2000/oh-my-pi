@@ -1,4 +1,6 @@
 import { runPauseScreen } from "@oh-my-pi/pi-tui/overlays/pause-screen";
+import { clearApprovalGrants } from "../tools/approval-cache";
+import { clearSubmittedText } from "./helpers/draft";
 import { shutdownHandlerTui } from "./builtin-lifecycle";
 import { commandConsumed, errorMessage, usage } from "./helpers/parse";
 import type { SlashCommandSpec } from "./types";
@@ -35,7 +37,7 @@ export const BUILTIN_CONTROL_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 
 			if (!toolName) {
 				runtime.ctx.showError("Usage: /force:<tool-name> [prompt]");
-				runtime.ctx.editor.setText("");
+				clearSubmittedText(runtime);
 				return;
 			}
 
@@ -44,11 +46,11 @@ export const BUILTIN_CONTROL_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				runtime.ctx.showStatus(`Next turn forced to use ${toolName}.`);
 			} catch (error) {
 				runtime.ctx.showError(errorMessage(error));
-				runtime.ctx.editor.setText("");
+				clearSubmittedText(runtime);
 				return;
 			}
 
-			runtime.ctx.editor.setText("");
+			clearSubmittedText(runtime);
 
 			// If a prompt was provided, pass it through as input
 			if (prompt) return { prompt };
@@ -59,7 +61,7 @@ export const BUILTIN_CONTROL_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		icon: "voice",
 		description: "Start Codex-backed realtime voice mode",
 		handleTui: async (_command, runtime) => {
-			runtime.ctx.editor.setText("");
+			clearSubmittedText(runtime);
 			await runtime.ctx.handleLiveCommand();
 		},
 	},
@@ -68,7 +70,7 @@ export const BUILTIN_CONTROL_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		icon: "export",
 		description: "Start or stop recording this screen to a replayable file (omp play)",
 		handleTui: async (_command, runtime) => {
-			runtime.ctx.editor.setText("");
+			clearSubmittedText(runtime);
 			await runtime.ctx.toggleRecording();
 		},
 	},
@@ -77,8 +79,18 @@ export const BUILTIN_CONTROL_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		icon: "pause",
 		description: "Freeze all agents (main, subagents, advisor) until resumed",
 		handleTui: async (_command, runtime) => {
-			runtime.ctx.editor.setText("");
+			clearSubmittedText(runtime);
 			await runPauseScreen(runtime.ctx);
+		},
+	},
+	{
+		name: "forget-approvals",
+		icon: "trash",
+		description: "Forget every file and folder approval Ask and remember has recorded",
+		handle: async (_command, runtime) => {
+			clearApprovalGrants(runtime.settings.getAgentDir());
+			await runtime.output("Remembered approvals forgotten; the next read or write asks again.");
+			return commandConsumed();
 		},
 	},
 	{

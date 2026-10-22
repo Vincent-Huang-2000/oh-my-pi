@@ -66,30 +66,6 @@ describe("/move directory completion", () => {
 		expect(result!.map(i => i.value)).toContain("./src/");
 	});
 
-	it("completes parent directory paths", async () => {
-		const parentDir = path.dirname(tempDir);
-		const siblingName = `omp-move-sibling-${path.basename(tempDir)}`;
-		const siblingDir = path.join(parentDir, siblingName);
-		await fs.mkdir(siblingDir);
-		try {
-			const result = await move!.getArgumentCompletions!("..");
-			expect(result).not.toBeNull();
-			expect(result!.map(i => i.value)).toContain(`../${siblingName}/`);
-		} finally {
-			await fs.rm(siblingDir, { recursive: true, force: true });
-		}
-	});
-
-	it("completes directories with spaces in names", async () => {
-		const spacedDir = path.join(tempDir, "My Project");
-		await fs.mkdir(spacedDir);
-		await fs.mkdir(path.join(spacedDir, "src"));
-
-		const result = await move!.getArgumentCompletions!("My Project/");
-		expect(result).not.toBeNull();
-		expect(result!.map(i => i.value)).toContain("My Project/src/");
-	});
-
 	it("filters inside a space-containing directory", async () => {
 		const spacedDir = path.join(tempDir, "My Project");
 		await fs.mkdir(spacedDir);

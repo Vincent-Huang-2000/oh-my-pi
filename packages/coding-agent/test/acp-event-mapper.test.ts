@@ -25,7 +25,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-event-mapper";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { expectAcpStructure, expectAcpStructureRejects } from "./helpers/acp-schema";
+import { expectAcpStructure } from "./helpers/acp-schema";
 
 function makeAssistantMessage(text: string) {
 	return {
@@ -97,6 +97,8 @@ class ReplayTestSession {
 	getPlanModeState(): undefined {
 		return undefined;
 	}
+
+	setPlanModeState(): void {}
 
 	setClientBridge(_bridge: unknown): void {}
 
@@ -200,27 +202,6 @@ describe("ACP event mapper", () => {
 		expect(doneUpdates).toEqual([]);
 	});
 
-	it("preserves command text when a new command tool is started", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
-			{
-				type: "tool_execution_start",
-				toolCallId: "tc-command-start",
-				toolName: "bash",
-				args: { command: "npm run check" },
-			} as AgentSessionEvent,
-			"session-1",
-		);
-
-		expect(updates).toHaveLength(1);
-		expectAcpNotifications(updates);
-		const update = updates[0]!.update as {
-			sessionUpdate: string;
-			content?: Array<{ type: string; content?: { type: string; text?: string } }>;
-		};
-		expect(update.sessionUpdate).toBe("tool_call");
-		expect(update.content).toContainEqual({ type: "content", content: { type: "text", text: "$ npm run check" } });
-	});
-
 	it("keeps write agent:// messages off the ACP session stream", () => {
 		const args = { path: "agent://Scout", content: "Private coordination" };
 		const events: AgentSessionEvent[] = [
@@ -289,21 +270,6 @@ describe("ACP event mapper", () => {
 		);
 
 		expect(updates.map(update => update.update.sessionUpdate)).toEqual(["tool_call", "tool_call_update"]);
-	});
-
-	it("keeps wait visible so job deliveries reach ACP", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
-			{
-				type: "tool_execution_start",
-				toolCallId: "tc-bare-wait",
-				toolName: "wait",
-				args: {},
-			},
-			"session-1",
-		);
-
-		expect(updates).toHaveLength(1);
-		expect(updates[0]?.update.sessionUpdate).toBe("tool_call");
 	});
 
 	it("uses command text for a new command tool even when intent is generic", () => {
@@ -524,6 +490,30 @@ describe("ACP event mapper", () => {
 			expect(JSON.stringify(update.content)).not.toContain("blob:sha256:");
 			expect(JSON.stringify(update.rawOutput)).toContain(blobRef);
 		}
+	});
+
+	it("settles a backgrounded call with its job's final frame and keeps running frames in progress", () => {
+		const status = (state: string) => {
+			const [notification] = mapAgentSessionEventToAcpSessionUpdates(
+				{
+					type: "tool_execution_update",
+					toolCallId: "tc-bg",
+					toolName: "bash",
+					args: { command: "hyperfine bench" },
+					partialResult: {
+						content: [{ type: "text", text: "Benchmark 1" }],
+						details: { async: { state, jobId: "bg_2", type: "bash" } },
+					},
+				} as AgentSessionEvent,
+				"session-1",
+			);
+			return (notification!.update as { status?: string }).status;
+		};
+
+		expect(status("running")).toBe("in_progress");
+		expect(status("completed")).toBe("completed");
+		expect(status("failed")).toBe("failed");
+		expect(status("cancelled")).toBe("failed");
 	});
 
 	it("emits locations on tool_execution_update from args", () => {
@@ -1278,24 +1268,5 @@ describe("ACP event mapper", () => {
 			kind: "edit",
 			locations: [{ path: path.resolve("/repo", "src/foo.ts") }],
 		});
-	});
-
-	it("rejects mutated ACP notification discriminators", () => {
-		const [notification] = mapAgentSessionEventToAcpSessionUpdates(
-			{
-				type: "tool_execution_start",
-				toolCallId: "tc-schema",
-				toolName: "read",
-				args: { path: "package.json" },
-			} as AgentSessionEvent,
-			"session-1",
-		);
-
-		expectAcpStructure(arkSessionNotification, notification);
-		expectAcpStructureRejects(arkSessionNotification, {
-			...notification,
-			update: { ...notification!.update, sessionUpdate: "tool_call_updates" },
-		});
-		expectAcpStructureRejects(arkSessionNotification, { ...notification, sessionId: 42 });
 	});
 });

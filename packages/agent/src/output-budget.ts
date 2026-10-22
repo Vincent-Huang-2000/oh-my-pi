@@ -18,6 +18,26 @@ export const MIN_FITTED_OUTPUT_TOKENS = 1024;
 const PROMPT_ESTIMATE_MARGIN_DIVISOR = 10;
 
 /**
+ * Chat-template framing charged per locally counted message. `Tokenizer.countMessage`
+ * counts content only, but every template wraps each message in role markers and
+ * separators, and tool results in response wrappers: about 5 tokens per merged
+ * Qwen3 `<tool_response>` or Llama 3 turn, 10–15 for harmony or Mistral tool results.
+ * The proportional margin scales with content, so many short messages (a turn's
+ * parallel tool results) leave this uncovered. Provider-anchored messages need no
+ * charge: the host's own report already includes their framing.
+ */
+export const MESSAGE_FRAMING_TOKENS = 16;
+
+/**
+ * Absolute headway subtracted from the remaining room (unconditionally, on anchored and
+ * fully-local counts alike). Covers per-request framing no message count sees: the
+ * generation prompt, the anchoring turn's end marker, reasoning wrappers. Measured
+ * against a 262,144-token host: fitted caps landed +11 to +42 tokens over and were
+ * rejected with 400s. The {@link MIN_FITTED_OUTPUT_TOKENS} floor still applies.
+ */
+export const OUTPUT_FIT_HEADWAY_TOKENS = 64;
+
+/**
  * Output cap for a request, so prompt plus output stays inside the model's
  * context window.
  *
@@ -32,7 +52,9 @@ const PROMPT_ESTIMATE_MARGIN_DIVISOR = 10;
  * The prompt size is the provider's own report from the newest trustworthy
  * assistant turn (see {@link findRequestUsageAnchor}) plus a local count of
  * only the messages appended after it; the whole context is counted locally
- * only when no turn can anchor (fresh or freshly rewritten context).
+ * only when no turn can anchor (fresh or freshly rewritten context). Local
+ * counts carry a proportional tokenizer margin plus
+ * {@link MESSAGE_FRAMING_TOKENS} per message.
  *
  * Returns `maxTokens` unchanged when the requested cap already fits, the
  * model declares no window, the host ends generation at the window itself
@@ -41,7 +63,8 @@ const PROMPT_ESTIMATE_MARGIN_DIVISOR = 10;
  * OpenRouter-hosted model with no caller cap: the transport omits the catalog
  * default there so each upstream self-caps, and a fitted value would turn into
  * an explicit cap that filters upstreams). Otherwise returns
- * the remaining room (never below {@link MIN_FITTED_OUTPUT_TOKENS}); a
+ * the remaining room minus {@link OUTPUT_FIT_HEADWAY_TOKENS} (never below
+ * {@link MIN_FITTED_OUTPUT_TOKENS}); a
  * prompt that fills the whole window still overflows and is left to the
  * caller's compaction. Near a full window the floor means a turn can stop on
  * `length` instead of failing with a 400.
@@ -67,7 +90,7 @@ export function fitOutputTokensToContextWindow(
 	if (!requested || !contextWindow || contextWindow <= 0) return maxTokens;
 	if (stopsOutputAtContextWindow(model)) return maxTokens;
 
-	const room = contextWindow - countPromptTokens(context, tokenizer);
+	const room = contextWindow - countPromptTokens(context, tokenizer) - OUTPUT_FIT_HEADWAY_TOKENS;
 	if (room >= requested) return maxTokens;
 	return Math.max(MIN_FITTED_OUTPUT_TOKENS, room);
 }
@@ -110,12 +133,14 @@ function withMargin(localTokens: number): number {
 function countPromptTokens(context: Context, tokenizer: Tokenizer): number {
 	const { messages } = context;
 	const anchor = findRequestUsageAnchor(messages);
-	if (!anchor) return withMargin(countContextTokens(context, tokenizer));
+	if (!anchor) {
+		return withMargin(countContextTokens(context, tokenizer)) + messages.length * MESSAGE_FRAMING_TOKENS;
+	}
 	let tail = 0;
 	for (let index = anchor.index + 1; index < messages.length; index++) {
 		tail += tokenizer.countMessage(messages[index]);
 	}
-	return anchor.tokens + withMargin(tail);
+	return anchor.tokens + withMargin(tail) + (messages.length - anchor.index - 1) * MESSAGE_FRAMING_TOKENS;
 }
 
 function countContextTokens(context: Context, tokenizer: Tokenizer): number {

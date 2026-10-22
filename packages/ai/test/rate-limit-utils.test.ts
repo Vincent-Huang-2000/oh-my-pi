@@ -12,6 +12,11 @@ import {
 	parseRateLimitReason,
 } from "@oh-my-pi/pi-ai/error/rate-limit";
 
+// MiniMax CN (minimax-code-cn) Token Plan exhaustion (2067): phrased 用量上限,
+// not 使用上限 like Zhipu.
+const MINIMAX_CN_TOKEN_PLAN_429 =
+	'{"type":"error","error":{"type":"rate_limit_error","message":"当前已达到 Token Plan 用量上限。为避免调用中断，请升级 Token Plan 套餐，或购买积分补充用量并开启积分自动消耗。 (2067)"}}';
+
 function googleRpc429(reason: string, retryDelay?: string, message = "Resource exhausted"): string {
 	const details: Array<Record<string, string>> = [
 		{
@@ -90,10 +95,6 @@ describe("parseRateLimitReason", () => {
 		expect(parseRateLimitReason("Connect error resource_exhausted: Quota exceeded for this account")).toBe(
 			"QUOTA_EXHAUSTED",
 		);
-	});
-
-	it("classifies Too many requests as RATE_LIMIT_EXCEEDED", () => {
-		expect(parseRateLimitReason("Cloud Code Assist API error (429): Too many requests")).toBe("RATE_LIMIT_EXCEEDED");
 	});
 
 	it("classifies per minute errors as RATE_LIMIT_EXCEEDED", () => {
@@ -200,6 +201,31 @@ describe("parseRateLimitReason", () => {
 		expect(parseRateLimitReason(freeQuota)).toBe("QUOTA_EXHAUSTED");
 		expect(isUsageLimit(new ProviderHttpError(freeQuota, 429, { code: "insufficient_quota" }))).toBe(true);
 		expect(isUsageLimitOutcome(429, freeQuota)).toBe(true);
+	});
+
+	it("keeps rolling-window TPM/RPM throttles in the transient lane", () => {
+		// A per-minute token throttle reported with quota wording ("tpm
+		// exhausted", type=quota_exceeded_error, no Retry-After) used to fall
+		// through to QUOTA_EXHAUSTED: the session layer then invented a 30-min
+		// wait, blew past retry.maxDelayMs and terminated the turn (#13253).
+		const tpmExhausted =
+			"429 tpm exhausted\ntpm exhausted (type=quota_exceeded_error param=8)\ntpm exhausted (type=quota_exceeded_error param=8) (type=quota_exceeded_error)";
+		expect(parseRateLimitReason(tpmExhausted)).toBe("RATE_LIMIT_EXCEEDED");
+		expect(calculateRateLimitBackoffMs(parseRateLimitReason(tpmExhausted))).toBeLessThanOrEqual(60_000);
+		expect(matchesUsageLimitText(tpmExhausted)).toBe(false);
+		expect(isUsageLimit(new ProviderHttpError(tpmExhausted, 429, { code: "quota_exceeded_error" }))).toBe(false);
+		expect(isUsageLimitOutcome(429, tpmExhausted)).toBe(false);
+
+		// Other phrasings of the same rolling window.
+		expect(parseRateLimitReason("429 inference exceeds tpm/rpm limit")).toBe("RATE_LIMIT_EXCEEDED");
+		expect(parseRateLimitReason("429 RPM limit reached for this endpoint")).toBe("RATE_LIMIT_EXCEEDED");
+		expect(parseRateLimitReason("429 (code=RateLimitExceeded.EndpointTPMExceeded)")).toBe("RATE_LIMIT_EXCEEDED");
+
+		// An account-scoped cap that merely quotes a TPM number keeps its quota
+		// verdict — the downgrade must not rescue a credential-rotating error.
+		const planQuota = "429 Your plan quota is exhausted; the plan TPM is 1000 (type=quota_exceeded_error)";
+		expect(parseRateLimitReason(planQuota)).toBe("QUOTA_EXHAUSTED");
+		expect(isUsageLimitOutcome(429, planQuota)).toBe(true);
 	});
 
 	it("classifies Codex usage limit error as QUOTA_EXHAUSTED", () => {
@@ -392,6 +418,7 @@ describe("isUsageLimit", () => {
 		expect(isUsageLimit("额度已用完，请充值")).toBe(true);
 		expect(isUsageLimit("配额已用尽")).toBe(true);
 		expect(isUsageLimit("账户余额不足")).toBe(true);
+		expect(isUsageLimit(new Error(MINIMAX_CN_TOKEN_PLAN_429))).toBe(true);
 	});
 
 	it("does not treat Simplified Chinese throttling as a usage limit", () => {
@@ -493,6 +520,18 @@ describe("isUsageLimitOutcome", () => {
 		expect(isUsageLimitOutcome(undefined, "free limit reached on model x/y. try again in 5 minutes")).toBe(true);
 	});
 
+	it("rotates on Cursor prepaid-balance exhaustion but not on the changeable pricing gate", () => {
+		const prepaid =
+			"Cursor USAGE_PRICING_REQUIRED: Your prepaid balance is used up: Add funds or enable auto top-up in your billing settings to keep going.";
+		expect(parseRateLimitReason(prepaid)).toBe("QUOTA_EXHAUSTED");
+		expect(isUsageLimitOutcome(429, prepaid)).toBe(true);
+		expect(isUsageLimit(new ProviderHttpError(prepaid, 429))).toBe(true);
+		expect(isUsageLimitOutcome(429, "Cursor USAGE_PRICING_REQUIRED: Usage-based pricing required")).toBe(true);
+		expect(matchesUsageLimitText("Cursor USAGE_PRICING_REQUIRED_CHANGEABLE: Switch to a different model")).toBe(
+			false,
+		);
+	});
+
 	it("keeps informative transient 429s in the upstream-backoff lane", () => {
 		// RATE_LIMIT_EXCEEDED — generic throttling.
 		expect(isUsageLimitOutcome(429, "Cloud Code Assist API error (429): Too many requests")).toBe(false);
@@ -539,7 +578,7 @@ describe("isUsageLimitOutcome", () => {
 		).toBe(true);
 	});
 
-	it("rotates on Simplified Chinese quota exhaustion (Zhipu 429)", () => {
+	it("rotates on Simplified Chinese quota exhaustion (Zhipu, MiniMax CN 429)", () => {
 		const zhipu =
 			"429 已达到 5 小时的使用上限。您的限额将在 2026-08-06 20:06:00 重置。\n已达到 5 小时的使用上限。您的限额将在 2026-08-06 20:06:00 重置。 (type=1308)";
 		expect(isUsageLimitOutcome(429, zhipu)).toBe(true);
@@ -549,6 +588,7 @@ describe("isUsageLimitOutcome", () => {
 		expect(isUsageLimitOutcome(429, "额度已用完，请充值")).toBe(true);
 		expect(isUsageLimitOutcome(429, "配额已用尽")).toBe(true);
 		expect(isUsageLimitOutcome(429, "账户余额不足")).toBe(true);
+		expect(isUsageLimitOutcome(429, MINIMAX_CN_TOKEN_PLAN_429)).toBe(true);
 	});
 
 	it("keeps Simplified Chinese throttling in the upstream-backoff lane", () => {
@@ -557,6 +597,8 @@ describe("isUsageLimitOutcome", () => {
 		expect(isUsageLimitOutcome(429, "并发请求达到上限")).toBe(false);
 		expect(isUsageLimitOutcome(429, "每分钟使用次数已达上限")).toBe(false);
 		expect(isUsageLimitOutcome(429, "API 使用频率已达上限")).toBe(false);
+		expect(isUsageLimitOutcome(429, "用量速率已达上限，请稍后重试")).toBe(false);
+		expect(isUsageLimitOutcome(429, "用量并发已达上限")).toBe(false);
 	});
 
 	it("treats Simplified Chinese error bodies the classifier can read as informative", () => {

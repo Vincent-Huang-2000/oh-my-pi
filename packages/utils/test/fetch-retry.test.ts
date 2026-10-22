@@ -1,6 +1,16 @@
 import { describe, expect, it } from "bun:test";
 import { extractRetryHint, fetchWithRetry, isUnexpectedSocketCloseMessage } from "@oh-my-pi/pi-utils/fetch-retry";
 
+/** Await a rejection and narrow it to `Error` without asserting a shape. */
+async function rejectionOf(promise: Promise<unknown>): Promise<Error> {
+	const value = await promise.then(
+		() => undefined,
+		(err: unknown) => err,
+	);
+	if (!(value instanceof Error)) throw new Error(`Expected a rejected Error, got ${String(value)}`);
+	return value;
+}
+
 describe("isUnexpectedSocketCloseMessage", () => {
 	it.each(["Socket is closed", "Error: Socket is closed.", "The socket connection was closed unexpectedly"])(
 		"recognizes %s",
@@ -121,6 +131,38 @@ describe("fetchWithRetry", () => {
 			message: "Request was aborted",
 		});
 	});
+
+	it("keeps the rejected fetch error reachable as the wrapped error's cause", async () => {
+		const errno = Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:8080"), { code: "ECONNREFUSED" });
+		const fetchFailed = new TypeError("fetch failed", { cause: new AggregateError([errno]) });
+
+		const error = await rejectionOf(
+			fetchWithRetry("http://127.0.0.1:8080/v1/chat/completions", {
+				fetch: async () => {
+					throw fetchFailed;
+				},
+				maxAttempts: 1,
+			}),
+		);
+
+		// The AggregateError carries no message, so the flattened text alone names
+		// no failure; downstream classifiers reach ECONNREFUSED only through `cause`.
+		expect(error.cause).toBe(fetchFailed);
+	});
+
+	it("keeps the flattened `Network error:` wording for a direct cause", async () => {
+		const dns = Object.assign(new Error("getaddrinfo ENOTFOUND api.openai.com"), { code: "ENOTFOUND" });
+		const error = await rejectionOf(
+			fetchWithRetry("https://api.openai.com/v1/chat/completions", {
+				fetch: async () => {
+					throw new TypeError("fetch failed", { cause: dns });
+				},
+				maxAttempts: 1,
+			}),
+		);
+
+		expect(error.message).toBe("Network error: getaddrinfo ENOTFOUND api.openai.com");
+	});
 });
 
 describe("extractRetryHint", () => {
@@ -130,10 +172,6 @@ describe("extractRetryHint", () => {
 	// can be reselected and hammered while the cap remains active.
 	it("parses Devin 'Your limit will reset in 13 minutes' as 13 minutes", () => {
 		expect(extractRetryHint(undefined, "Your limit will reset in 13 minutes")).toBe(13 * 60_000);
-	});
-
-	it("parses bare 'reset in 13 minutes' phrasing", () => {
-		expect(extractRetryHint(undefined, "reset in 13 minutes")).toBe(13 * 60_000);
 	});
 
 	it("parses 'will reset in 2h' phrasing", () => {

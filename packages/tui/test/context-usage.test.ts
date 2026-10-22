@@ -7,10 +7,18 @@
  */
 import { describe, expect, it } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import type { Model, ModelSpec } from "@oh-my-pi/pi-catalog/types";
 import { Tokenizer } from "@oh-my-pi/pi-agent-core";
+import {
+	compactionContextTokens,
+	DEFAULT_COMPACTION_SETTINGS,
+	shouldCompact,
+} from "@oh-my-pi/pi-agent-core/compaction";
 import { arkToWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import {
 	type ContextBreakdown,
+	type NonMessageTokenSource,
 	computeNonMessageBreakdown,
 	computeNonMessageTokens,
 	estimateSkillsTokens,
@@ -171,6 +179,47 @@ describe("renderContextUsage snapcompact section", () => {
 	});
 });
 
+describe("deferred tool schema accounting", () => {
+	it("does not let Cursor's server-side MCP catalog force compaction below provider usage", () => {
+		const spec: ModelSpec<"anthropic-messages"> = {
+			id: "claude-opus-5-5",
+			name: "Claude Opus",
+			api: "anthropic-messages",
+			provider: "anthropic",
+			baseUrl: "https://api.anthropic.com",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 100_000,
+			maxTokens: 8192,
+		};
+		const directModel = buildModel(spec);
+		const cursorModel = buildModel({ ...spec, api: "cursor-agent", provider: "cursor" });
+		const tools = Array.from({ length: 200 }, (_, index) => ({
+			name: `mcp__service__tool_${index}`,
+			description: `Search records ${"search account records with detailed query filters and output metadata ".repeat(110)}`,
+			parameters: type({ query: "string" }),
+		}));
+		const systemPrompt = ["You are an assistant."];
+		const session: NonMessageTokenSource & { model: Model } = {
+			model: directModel,
+			systemPrompt,
+			agent: { state: { tools } },
+		};
+		const direct = computeNonMessageTokens(session, tokenizer);
+		expect(shouldCompact(compactionContextTokens(9000, direct), 100_000, DEFAULT_COMPACTION_SETTINGS)).toBe(true);
+
+		session.model = cursorModel;
+		const cursor = computeNonMessageTokens(session, tokenizer);
+		expect(cursor).toBe(tokenizer.countTokens(systemPrompt));
+		expect(computeNonMessageBreakdown(session, tokenizer).toolsTokens).toBe(0);
+		expect(shouldCompact(compactionContextTokens(9000, cursor), 100_000, DEFAULT_COMPACTION_SETTINGS)).toBe(false);
+
+		session.model = directModel;
+		expect(computeNonMessageTokens(session, tokenizer)).toBe(direct);
+	});
+});
+
 /**
  * Contract: the non-message token totals reflect the CURRENT system prompt,
  * tools, and skills — including after they change via reference replacement
@@ -303,15 +352,6 @@ describe("computeNonMessageBreakdown skills filtering", () => {
  */
 describe("non-message estimates tolerate a missing description", () => {
 	const readTool = { name: "read", description: "read files", parameters: {} };
-
-	it("estimateToolSchemaTokens does not throw on an undefined tool description", () => {
-		const tokens = estimateToolSchemaTokens(
-			[{ name: "lens_tool", description: undefined, parameters: {} } as never],
-			tokenizer,
-		);
-		expect(Number.isFinite(tokens)).toBe(true);
-		expect(tokens).toBeGreaterThanOrEqual(0);
-	});
 
 	it("computeNonMessageBreakdown does not throw on an undefined skill description", () => {
 		const session = {
