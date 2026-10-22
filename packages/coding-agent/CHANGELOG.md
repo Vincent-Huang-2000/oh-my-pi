@@ -2,21 +2,18 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the `omp.planReview` v1 ACP plan-review extension: form-capable ACP clients now get a full five-option review (approve with a fresh session, compact, or keep context; refine with feedback; save and quit) with execution-model selection, a `plan_review_update` session update carrying the review content, `omp.planReview/reopen` and `omp.planReview/action` extension methods, and pending-review restoration when a session reloads.
+- ACP sessions now report `omp.planMode`/`omp.planReview` snapshots in `_meta` on session creation, load, resume, fork, and mode changes.
+- Anthropic web search and Files API uploads follow `PI_ANTHROPIC_API_VERSION=2026-10-21`; web search omits `temperature` under that version ([#16706](https://github.com/can1357/oh-my-pi/pull/16706) by [@H4vC](https://github.com/H4vC))
+
 ### Fixed
 
 - Fixed ACP keep-context approvals bypassing the 95% context limit through form replies or queued review actions.
 - Fixed ACP sessions losing plan mode on reload before the first proposal or after dismissing a review.
 - Fixed late ACP plan-review replies resurrecting closed reviews or modifying a newer review after a mode change.
 - Fixed ACP fresh-session plan execution and saving to announce the replacement session ID and keep subsequent requests and tool calls routed to that session.
-
-### Added
-
-- Added the `omp.planReview` v1 ACP plan-review extension: form-capable ACP clients now get a full five-option review (approve with a fresh session, compact, or keep context; refine with feedback; save and quit) with execution-model selection, a `plan_review_update` session update carrying the review content, `omp.planReview/reopen` and `omp.planReview/action` extension methods, and pending-review restoration when a session reloads.
-- ACP sessions now report `omp.planMode`/`omp.planReview` snapshots in `_meta` on session creation, load, resume, fork, and mode changes.
-## [18.3.2] - 2026-09-25
-### Added
-
-- Anthropic web search and Files API uploads follow `PI_ANTHROPIC_API_VERSION=2026-10-21`; web search omits `temperature` under that version ([#16706](https://github.com/can1357/oh-my-pi/pull/16706) by [@H4vC](https://github.com/H4vC))
 
 ## [18.12.6] - 2026-10-21
 
