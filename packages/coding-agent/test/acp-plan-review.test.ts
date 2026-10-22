@@ -46,6 +46,7 @@ class FakeAgentSession {
 	customCommands: [] = [];
 	promptCalls: string[] = [];
 	followUpCalls: string[] = [];
+	steerCalls: string[] = [];
 	compactCalls: Array<{ instructions: string | undefined; options: unknown }> = [];
 	applyRoleModelCalls: Array<{ role: string }> = [];
 	planModeState: { enabled: boolean; planFilePath: string; workflow?: string; reentry?: boolean } | undefined;
@@ -90,6 +91,12 @@ class FakeAgentSession {
 
 	async followUp(text: string): Promise<void> {
 		this.followUpCalls.push(text);
+	}
+
+	async joinActiveTurn(text: string): Promise<boolean> {
+		if (!this.isStreaming) return false;
+		this.steerCalls.push(text);
+		return true;
 	}
 
 	async compact(instructions?: string, options?: unknown): Promise<void> {
@@ -485,6 +492,56 @@ describe("planReviewExecutionModels", () => {
 });
 
 describe("ACP plan review", () => {
+	it("steering during review keeps the approval gate and idle steering leaves the review reopenable", async () => {
+		const opened = Promise.withResolvers<void>();
+		const response = Promise.withResolvers<CreateElicitationResponse>();
+		const harness = await createHarness({
+			elicitationHandler: async () => {
+				opened.resolve();
+				return response.promise;
+			},
+		});
+		try {
+			const { created, session } = await createPlanSession(harness);
+			session.prompt = async () => {
+				session.isStreaming = true;
+				await session.planProposalHandler!("words-counter");
+				session.isStreaming = false;
+				session.emit({ type: "agent_end", messages: [] });
+				return true;
+			};
+			const running = harness.agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "plan" }],
+			});
+			await opened.promise;
+			expect(
+				await harness.agent.extMethod("_session/steering", {
+					sessionId: created.sessionId,
+					prompt: [{ type: "text", text: "also cover empty input" }],
+				}),
+			).toEqual({ outcome: "injected", queue: "steering" });
+			expect(session.steerCalls).toEqual(["also cover empty input"]);
+			expect(session.planModeState?.enabled).toBe(true);
+			expect(session.planReferenceSent).toBe(false);
+			response.resolve({ action: "accept", content: { decision: "refine" } });
+			await running;
+			expect(
+				await harness.agent.extMethod("_session/steering", {
+					sessionId: created.sessionId,
+					prompt: [{ type: "text", text: "continue planning" }],
+				}),
+			).toEqual({ outcome: "promptRequired", queue: "steering" });
+			expect((await harness.agent.extMethod("omp.planReview/reopen", { sessionId: created.sessionId })).ok).toBe(
+				true,
+			);
+			expect(session.planModeState?.enabled).toBe(true);
+		} finally {
+			response.resolve({ action: "cancel" });
+			await harness.agent.dispose();
+		}
+	});
+
 	it.each(["execute", "compact", "keep", "save"])(
 		"completes deferred %s inside the owning prompt at the allowed context boundary",
 		async decision => {
