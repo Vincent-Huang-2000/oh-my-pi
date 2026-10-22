@@ -628,6 +628,32 @@ describe("ACP plan review", () => {
 		}
 	});
 
+	it("cancels a review action accepted before its dispatch slot exists", async () => {
+		const harness = await createHarness({
+			elicitationHandler: async () => ({ action: "accept", content: { decision: "refine" } }),
+		});
+		try {
+			const { created, session } = await createPlanSession(harness);
+			await session.planProposalHandler!("words-counter");
+			const reviewId = reviewUpdates(harness.updates).find(update => update.review)?.review?.reviewId;
+			const action = harness.agent.extMethod("omp.planReview/action", {
+				sessionId: created.sessionId,
+				reviewId,
+				decision: "execute",
+			});
+			await harness.agent.cancel({ sessionId: created.sessionId });
+			expect(await action).toMatchObject({ ok: false });
+			expect(session.sessionId).toBe(created.sessionId);
+			expect(session.promptCalls).toEqual([]);
+			expect(session.planModeState?.enabled).toBe(true);
+			expect((await harness.agent.extMethod("omp.planReview/reopen", { sessionId: created.sessionId })).ok).toBe(
+				true,
+			);
+		} finally {
+			await harness.agent.dispose();
+		}
+	});
+
 	it("does not dispatch approved execution after cancellation during compaction", async () => {
 		const compacting = Promise.withResolvers<void>();
 		const releaseCompact = Promise.withResolvers<void>();

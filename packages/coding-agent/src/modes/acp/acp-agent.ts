@@ -1556,36 +1556,43 @@ export class AcpAgent implements Agent {
 			}
 			case "omp.planReview/action": {
 				const record = this.#getPlanReviewRecord(params);
-				const decision = validatePlanReviewDecision(
-					parsePlanReviewAction(params),
-					record.session.getContextUsage(),
-				);
-				if (!decision) {
-					return { ok: false, error: "Invalid plan review action." };
+				const cancellation: PromptDispatchCancellation = { cancelled: false };
+				record.pendingPromptDispatches.push(cancellation);
+				try {
+					const decision = validatePlanReviewDecision(
+						parsePlanReviewAction(params),
+						record.session.getContextUsage(),
+					);
+					if (!decision) {
+						return { ok: false, error: "Invalid plan review action." };
+					}
+					if (decision.kind === "invalid") {
+						return { ok: false, error: decision.reason };
+					}
+					const state = await this.#readPlanReviewState(record.session);
+					if (
+						!state ||
+						(typeof params.reviewId === "string" && params.reviewId && params.reviewId !== state.reviewId)
+					) {
+						return { ok: false, error: "No pending plan review matches the supplied review id." };
+					}
+					const content = await this.#readAcpPlanFile(record.session, state.planFilePath);
+					if (content === null) {
+						return { ok: false, error: "The plan file for the pending review no longer exists." };
+					}
+					const outcome: PlanReviewOutcome = {
+						...decision,
+						reviewId: state.reviewId,
+						planFilePath: state.planFilePath,
+						title: state.title,
+						content,
+					};
+					const error = await this.#runPlanReviewAction(record, outcome, cancellation);
+					return error ? { ok: false, error } : { ok: true };
+				} finally {
+					const index = record.pendingPromptDispatches.indexOf(cancellation);
+					if (index >= 0) record.pendingPromptDispatches.splice(index, 1);
 				}
-				if (decision.kind === "invalid") {
-					return { ok: false, error: decision.reason };
-				}
-				const state = await this.#readPlanReviewState(record.session);
-				if (
-					!state ||
-					(typeof params.reviewId === "string" && params.reviewId && params.reviewId !== state.reviewId)
-				) {
-					return { ok: false, error: "No pending plan review matches the supplied review id." };
-				}
-				const content = await this.#readAcpPlanFile(record.session, state.planFilePath);
-				if (content === null) {
-					return { ok: false, error: "The plan file for the pending review no longer exists." };
-				}
-				const outcome: PlanReviewOutcome = {
-					...decision,
-					reviewId: state.reviewId,
-					planFilePath: state.planFilePath,
-					title: state.title,
-					content,
-				};
-				const error = await this.#runPlanReviewAction(record, outcome);
-				return error ? { ok: false, error } : { ok: true };
 			}
 			case SESSION_STEERING_METHOD:
 				return await this.#handleSessionSteering(params);
@@ -3068,10 +3075,21 @@ export class AcpAgent implements Agent {
 	/** Run a review decision submitted through the `omp.planReview/action`
 	 *  extension method inside a synthetic prompt turn, so the resulting
 	 *  agent turn streams to the client like a client-initiated prompt. */
-	async #runPlanReviewAction(record: ManagedSessionRecord, outcome: PlanReviewOutcome): Promise<string | undefined> {
+	async #runPlanReviewAction(
+		record: ManagedSessionRecord,
+		outcome: PlanReviewOutcome,
+		cancellation: PromptDispatchCancellation,
+	): Promise<string | undefined> {
 		let actionError: string | undefined;
 		await this.#queuePrompt(record, async () => {
+			const previousTurn = record.promptTurn;
+			await previousTurn?.promise.catch(() => undefined);
+			await previousTurn?.cleanup;
 			this.#throwIfRecordClosed(record);
+			if (cancellation.cancelled) {
+				actionError = "Plan review action was cancelled.";
+				return { stopReason: "cancelled" };
+			}
 			const pendingPrompt = Promise.withResolvers<PromptResponse>();
 			const promptTurn: PromptTurnState = {
 				abortController: new AbortController(),
