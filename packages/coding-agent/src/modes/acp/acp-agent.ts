@@ -19,6 +19,7 @@ import {
 	type ElicitationPropertySchema,
 	type ForkSessionRequest,
 	type ForkSessionResponse,
+	type GoalModeArmed,
 	type InitializeRequest,
 	type InitializeResponse,
 	type ListSessionsRequest,
@@ -70,6 +71,7 @@ import { loadAllExtensions } from "../../modes/components/extensions/state-manag
 import { theme } from "@oh-my-pi/pi-tui/theme";
 import { normalizePlanTitle, type PlanApprovalDetails, resolveApprovedPlan } from "../../plan-mode/approved-plan";
 import { autosaveApprovedPlan } from "../../plan-mode/plan-autosave";
+import guidedGoalInterviewPrompt from "../../prompts/goals/guided-goal-interview.md" with { type: "text" };
 import planModeApprovedPrompt from "../../prompts/system/plan-mode-approved.md" with { type: "text" };
 import planModeCompactInstructionsPrompt from "../../prompts/system/plan-mode-compact-instructions.md" with { type: "text" };
 import type { AgentSession, AgentSessionEvent, ResolvedRoleModel } from "../../session/agent-session";
@@ -115,10 +117,23 @@ import {
 	type PlanReviewOutcome,
 } from "./acp-plan-review";
 import type { PlanReviewOption } from "@oh-my-pi/pi-utils/acp";
+import {
+	ACP_GOAL_COMMANDS,
+	ACP_GOAL_CONTINUATION_MODE,
+	ACP_GOAL_MODE_ID,
+	buildGoalModeMeta,
+	buildGoalModeSnapshot,
+	formatGoalDetails,
+	GOAL_USAGE,
+	parseGoalBudget,
+} from "./acp-run-modes";
 import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
 
 import { cfgDisabledExtensions } from "../../extensibility/settings";
+import { parseGoalSubcommand } from "../../goals/commands";
+import { cfgGoalEnabled } from "../../goals/settings";
 import { cfgPlanEnabled } from "../../plan-mode/settings";
+import { RpcGoalController } from "../rpc/rpc-goal";
 
 const ACP_DEFAULT_MODE_ID = "default";
 const ACP_PLAN_MODE_ID = "plan";
@@ -195,6 +210,12 @@ type PromptTurnState = {
 	 * "turn in flight" predicate (`isPromptTurnInFlight`) every consumer gates on.
 	 */
 	cleanup: Promise<void> | undefined;
+	/**
+	 * One `agent_end` handler (or run-mode command) is settling this turn across
+	 * follow-up work it owns — goal continuations, vibe worker results. Nested
+	 * turns' `agent_end` handlers flush their own output and leave settlement to it.
+	 */
+	settling: boolean;
 	usageBaseline: UsageStatistics;
 	unsubscribe: (() => void) | undefined;
 	resolve: (value: PromptResponse) => void;
@@ -372,6 +393,15 @@ type ManagedSessionRecord = {
 
 	/** Plan-review decision awaiting execution at the current turn's end. */
 	pendingPlanOutcome: PlanReviewOutcome | undefined;
+	/** Goal lifecycle (tool set, completion, reload, continuation), shared with RPC hosts. */
+	goal: RpcGoalController;
+	/** Goal mode entered before a goal exists: the next prompt is the objective, or the guided interview runs. */
+	goalArmed: GoalModeArmed | undefined;
+	/** Last `goal_update` body and mode id the client was told about; pushes only on change. */
+	reportedGoalSnapshot: string | undefined;
+	reportedModeId: string | undefined;
+	/** Releases the run-mode session subscription installed at registration. */
+	runModeUnsubscribe: (() => void) | undefined;
 	planReviewMutation: Promise<void>;
 	// Cancellation carriers for client prompts accepted on the wire whose
 	// turn slot does not exist yet (queued behind another prompt or still
@@ -1085,6 +1115,7 @@ export class AcpAgent implements Agent {
 					settled: false,
 					errorTextDelivery: undefined,
 					cleanup: undefined,
+					settling: false,
 					usageBaseline: this.#cloneUsageStatistics(record.session.sessionManager.getUsageStatistics()),
 					unsubscribe: undefined,
 					resolve: pendingPrompt.resolve,
@@ -1232,6 +1263,9 @@ export class AcpAgent implements Agent {
 			});
 			return;
 		}
+		if (await this.#tryRunRunModeCommand(record, text, images)) {
+			return;
+		}
 
 		const builtinResult = await executeAcpBuiltinSlashCommand(text, {
 			session: record.session,
@@ -1322,6 +1356,16 @@ export class AcpAgent implements Agent {
 			return;
 		}
 
+		// Goal mode selected before a goal exists: this prompt is the objective, and
+		// runs as the goal's first turn (the TUI's `/goal <objective>` flow).
+		if (record.goalArmed === "objective" && text.trim() && !text.trimStart().startsWith("/")) {
+			const error = await this.#startGoal(record, text.trim());
+			if (error) {
+				await this.#finishRunModeCommand(record, error);
+				return;
+			}
+		}
+
 		const extensionPromptBaseline = new Set(record.extensionUserMessageTasks);
 		const agentInvoked = await record.session.prompt(text, { images });
 		// Extension and custom-TS commands are handled locally inside session.prompt().
@@ -1370,6 +1414,8 @@ export class AcpAgent implements Agent {
 		for (const cancellation of record.pendingPromptDispatches) {
 			cancellation.cancelled = true;
 		}
+		// Stop means no further goal turn; the abort itself pauses an active goal.
+		record.goal.stopForHostAbort();
 		const promptTurn = record.promptTurn;
 		// A turn whose cancel cleanup is still unwinding counts as in
 		// flight: a repeated cancel notification must reuse that barrier
@@ -1425,6 +1471,7 @@ export class AcpAgent implements Agent {
 			return promptTurn.cleanup;
 		}
 		record.pendingPlanOutcome = undefined;
+		record.goal.stopForHostAbort();
 		promptTurn.cancelRequested = true;
 		promptTurn.abortController.abort();
 		promptTurn.unsubscribe?.();
@@ -1806,7 +1853,11 @@ export class AcpAgent implements Agent {
 		// Restore a pending plan review (and plan mode) whenever this session
 		// switches files — `#openStoredSession` and `#forkManagedSession` both
 		// route through `session.switchSession`, which invokes the reconciler.
-		session.setSessionSwitchReconciler?.(() => this.#reconcilePlanModeFromSession(record));
+		session.setSessionSwitchReconciler?.(() => this.#reconcileModesFromSession(record));
+		// Installed before any prompt-turn subscription, so the goal controller sees
+		// each `agent_end` (and schedules a continuation) before the prompt handler
+		// decides whether the turn settles.
+		record.runModeUnsubscribe = session.subscribe(event => this.#observeRunModeEvent(record, event));
 		try {
 			await this.#configureExtensions(record);
 			await this.#configureMcpServers(record, mcpServers);
@@ -1816,7 +1867,7 @@ export class AcpAgent implements Agent {
 			// it is installed after `#openStoredSession`'s `switchSession` — so
 			// the load-time restore must run here. Fresh sessions find no state
 			// and stay in the default mode.
-			await this.#reconcilePlanModeFromSession(record);
+			await this.#reconcileModesFromSession(record);
 			return record;
 		} catch (error) {
 			await this.#disposeSessionRecord(record);
@@ -1828,7 +1879,16 @@ export class AcpAgent implements Agent {
 		session: AgentSession,
 		setToolUIContext: ((uiContext: ExtensionUIContext, hasUI: boolean) => void) | undefined = undefined,
 	): ManagedSessionRecord {
-		return {
+		// Goal turns may only run while a client prompt owns the turn: outside one
+		// they would stream nowhere and the client could not cancel them.
+		const goal = new RpcGoalController(session, undefined, {
+			continuationMode: ACP_GOAL_CONTINUATION_MODE,
+			canContinue: () => {
+				const promptTurn = record.promptTurn;
+				return promptTurn !== undefined && !promptTurn.settled && !promptTurn.cancelRequested;
+			},
+		});
+		const record: ManagedSessionRecord = {
 			session,
 			setToolUIContext,
 			mcpManager: undefined,
@@ -1836,6 +1896,11 @@ export class AcpAgent implements Agent {
 			pendingMcpStartupChunks: [],
 			promptTurn: undefined,
 			pendingPlanOutcome: undefined,
+			goal,
+			goalArmed: undefined,
+			reportedGoalSnapshot: undefined,
+			reportedModeId: undefined,
+			runModeUnsubscribe: undefined,
 			planReviewMutation: Promise.resolve(),
 			promptQueue: { promise: Promise.resolve(), release: undefined },
 			liveMessageId: undefined,
@@ -1848,6 +1913,7 @@ export class AcpAgent implements Agent {
 			promptEventHandlers: new Set(),
 			lifetimeUnsubscribe: undefined,
 		};
+		return record;
 	}
 
 	async #handleLifetimeEvent(record: ManagedSessionRecord, event: AgentSessionEvent): Promise<void> {
@@ -1961,39 +2027,83 @@ export class AcpAgent implements Agent {
 			await this.#flushMissedFinalAssistantText(record, event);
 			await this.#flushUnreportedTurnError(record, event);
 			await this.#emitEndOfTurnUpdates(record);
-			await this.#waitForAcpPromptIdle(record);
-			if (record.promptTurn !== promptTurn || promptTurn.abortController.signal.aborted) return;
-			// A deferred plan-review outcome (fresh session, compaction, model
-			// switch, save-and-quit) runs here: the turn has settled, the
-			// session is idle, and the prompt-turn subscription is still alive
-			// so the synthetic execution turn streams to the client.
-			const pendingOutcome = record.pendingPlanOutcome;
-			record.pendingPlanOutcome = undefined;
-			if (pendingOutcome) {
-				try {
-					const error = await this.#executePlanReviewOutcome(
-						record.session,
-						pendingOutcome,
-						promptTurn.abortController.signal,
-					);
-					if (error) {
-						await this.#emitPlanReviewClosed(record.session);
-						await this.#emitCommandOutput(record, error);
-					}
-				} catch (error) {
-					if (!promptTurn.abortController.signal.aborted) {
-						logger.warn("ACP plan review outcome failed", { sessionId: record.session.sessionId, error });
-					}
+			// A goal continuation (or vibe worker result) turn inside this prompt:
+			// the handler already settling the prompt owns its end.
+			if (promptTurn.settling) return;
+			promptTurn.settling = true;
+			try {
+				await this.#settlePromptTurnAfterAgentEnd(record, promptTurn, event);
+			} finally {
+				promptTurn.settling = false;
+			}
+		}
+	}
+
+	async #settlePromptTurnAfterAgentEnd(
+		record: ManagedSessionRecord,
+		promptTurn: PromptTurnState,
+		event: Extract<AgentSessionEvent, { type: "agent_end" }>,
+	): Promise<void> {
+		await this.#waitForAcpPromptIdle(record);
+		if (record.promptTurn !== promptTurn || promptTurn.abortController.signal.aborted) return;
+		// A deferred plan-review outcome (fresh session, compaction, model
+		// switch, save-and-quit) runs here: the turn has settled, the
+		// session is idle, and the prompt-turn subscription is still alive
+		// so the synthetic execution turn streams to the client.
+		const pendingOutcome = record.pendingPlanOutcome;
+		record.pendingPlanOutcome = undefined;
+		if (pendingOutcome) {
+			try {
+				const error = await this.#executePlanReviewOutcome(
+					record.session,
+					pendingOutcome,
+					promptTurn.abortController.signal,
+				);
+				if (error) {
+					await this.#emitPlanReviewClosed(record.session);
+					await this.#emitCommandOutput(record, error);
+				}
+			} catch (error) {
+				if (!promptTurn.abortController.signal.aborted) {
+					logger.warn("ACP plan review outcome failed", { sessionId: record.session.sessionId, error });
 				}
 			}
-			if (record.promptTurn !== promptTurn || promptTurn.abortController.signal.aborted) return;
-			record.liveMessageId = undefined;
-			record.liveMessageProgress = undefined;
-			this.#finishPrompt(record, {
-				stopReason: pendingOutcome ? "end_turn" : this.#resolveStopReason(event, promptTurn.cancelRequested),
-				usage: this.#buildTurnUsage(promptTurn.usageBaseline, record.session.sessionManager.getUsageStatistics()),
-			});
 		}
+		if (record.promptTurn !== promptTurn || promptTurn.abortController.signal.aborted) return;
+		const followedUp = await this.#runPromptFollowUps(record, promptTurn);
+		if (record.promptTurn !== promptTurn || promptTurn.abortController.signal.aborted) return;
+		record.liveMessageId = undefined;
+		record.liveMessageProgress = undefined;
+		this.#finishPrompt(record, {
+			stopReason:
+				pendingOutcome || followedUp ? "end_turn" : this.#resolveStopReason(event, promptTurn.cancelRequested),
+			usage: this.#buildTurnUsage(promptTurn.usageBaseline, record.session.sessionManager.getUsageStatistics()),
+		});
+	}
+
+	/**
+	 * Keep a client prompt open while work it owns continues: goal continuation
+	 * turns the goal controller schedules at each yield. Each follow-up turn
+	 * streams through the prompt's subscription. Returns whether any ran; the
+	 * run-mode state is pushed to the client before the prompt settles.
+	 */
+	async #runPromptFollowUps(record: ManagedSessionRecord, promptTurn: PromptTurnState): Promise<boolean> {
+		const session = record.session;
+		let followedUp = false;
+		while (record.promptTurn === promptTurn && !promptTurn.abortController.signal.aborted) {
+			if (!record.goal.continuationPending) break;
+			await record.goal.whenContinuationDecided();
+			// A dropped continuation leaves the session idle.
+			if (!session.isStreaming && !session.hasAdmittedSubmission) continue;
+			followedUp = true;
+			// An admitted continuation may not be streaming yet, and `waitForIdle` does
+			// not wait for it: let it dispatch first, then wait for its run.
+			await session.waitForAdmittedSubmissions();
+			await this.#waitForAcpPromptIdle(record);
+		}
+		await record.goal.settled();
+		await this.#syncRunModeState(record);
+		return followedUp;
 	}
 
 	/**
@@ -2368,12 +2478,21 @@ export class AcpAgent implements Agent {
 				description: "Read-only planning mode that drafts a plan to a markdown file before any code changes",
 			});
 		}
-		void session;
+		if (cfgGoalEnabled.get(session.settings)) {
+			modes.push({
+				id: ACP_GOAL_MODE_ID,
+				name: "Goal",
+				description: "Persistent objective the agent keeps working toward until it is complete",
+			});
+		}
 		return modes;
 	}
 
+	/** Plan, goal, and vibe share one mode slot (the session journal records a single mode). */
 	#getCurrentModeId(session: AgentSession): string {
-		return session.getPlanModeState()?.enabled ? ACP_PLAN_MODE_ID : ACP_DEFAULT_MODE_ID;
+		if (session.getPlanModeState()?.enabled) return ACP_PLAN_MODE_ID;
+		if (session.getGoalModeState() || this.#sessions.get(session.sessionId)?.goalArmed) return ACP_GOAL_MODE_ID;
+		return ACP_DEFAULT_MODE_ID;
 	}
 
 	/** 模式退出与审核响应共用串行边界，避免已通过校验的旧响应在清理之后落盘。 */
@@ -2396,7 +2515,20 @@ export class AcpAgent implements Agent {
 			if (!availableModes.some(mode => mode.id === modeId)) {
 				throw new Error(`Unsupported ACP mode: ${modeId}`);
 			}
-			if (modeId === ACP_PLAN_MODE_ID) {
+			const currentModeId = this.#getCurrentModeId(session);
+			if (modeId === ACP_GOAL_MODE_ID && currentModeId === ACP_GOAL_MODE_ID) {
+				// Re-selecting goal mode resumes a paused goal; an active or armed goal is unchanged.
+				if (session.getGoalModeState()?.goal.status === "paused") await record.goal.handle({ op: "resume" });
+				return;
+			}
+			// The goal cannot share the single mode slot with another mode: leaving
+			// goal mode drops it (accumulated usage stays in the session log).
+			if (currentModeId === ACP_GOAL_MODE_ID) await this.#exitGoalMode(record);
+			if (modeId === ACP_GOAL_MODE_ID) {
+				if (currentModeId === ACP_PLAN_MODE_ID) await this.#exitPlanMode(record);
+				// No goal yet: the next prompt becomes its objective.
+				record.goalArmed = "objective";
+			} else if (modeId === ACP_PLAN_MODE_ID) {
 				const previous = session.getPlanModeState();
 				const planFilePath = previous?.planFilePath ?? DEFAULT_PLAN_FILE_URL;
 				session.setPlanModeState({
@@ -2413,17 +2545,300 @@ export class AcpAgent implements Agent {
 				session.setPlanProposalHandler?.(title => this.#handleAcpPlanProposal(session, title));
 				session.sessionManager.appendModeChange(ACP_PLAN_MODE_ID, { planFilePath });
 			} else {
-				session.setPlanProposalHandler?.(null);
-				session.setPlanModeState(undefined);
-				session.sessionManager.appendModeChange("none");
-				// An explicit mode exit also consumes any pending review: the
-				// deferred approval outcome never runs and the persisted review
-				// state is gone, so a reload cannot resurrect plan mode.
-				record.pendingPlanOutcome = undefined;
-				await this.#deletePlanReviewState(session);
-				await this.#emitPlanReviewClosed(session);
+				await this.#exitPlanMode(record);
 			}
 		});
+		// Callers report the mode change themselves; push the goal snapshot alongside.
+		await this.#syncRunModeState(record, { modeReported: true });
+	}
+
+	async #exitPlanMode(record: ManagedSessionRecord): Promise<void> {
+		const session = record.session;
+		session.setPlanProposalHandler?.(null);
+		session.setPlanModeState(undefined);
+		session.sessionManager.appendModeChange("none");
+		// An explicit mode exit also consumes any pending review: the
+		// deferred approval outcome never runs and the persisted review
+		// state is gone, so a reload cannot resurrect plan mode.
+		record.pendingPlanOutcome = undefined;
+		await this.#deletePlanReviewState(session);
+		await this.#emitPlanReviewClosed(session);
+	}
+
+	/** Leave goal mode: drop the goal, or cancel an armed entry (restoring the pre-interview tools). */
+	async #exitGoalMode(record: ManagedSessionRecord): Promise<void> {
+		const armed = record.goalArmed;
+		record.goalArmed = undefined;
+		if (record.session.getGoalModeState()) {
+			await record.goal.handle({ op: "drop" });
+		} else if (armed === "interview") {
+			await record.goal.releaseInterviewTool();
+		}
+	}
+
+	#observeRunModeEvent(record: ManagedSessionRecord, event: AgentSessionEvent): void {
+		record.goal.observe(event);
+		if (event.type !== "goal_updated") return;
+		// A goal created by the guided interview's `goal create` (or resumed) ends the armed entry.
+		if (event.state) record.goalArmed = undefined;
+		// A drop is announced before the state clears; its caller (or the prompt's
+		// settlement) pushes the cleared snapshot instead of a stale one.
+		if (event.state?.goal.status === "dropped") return;
+		void this.#syncRunModeState(record).catch((error: unknown) => {
+			logger.warn("Failed to push ACP goal update", { sessionId: record.session.sessionId, error });
+		});
+	}
+
+	/**
+	 * Push the goal snapshot and current mode when they changed since the client
+	 * last saw them. Before bootstrap the client knows the session only from its
+	 * response, whose `_meta` already carries this state.
+	 */
+	async #syncRunModeState(record: ManagedSessionRecord, options?: { modeReported?: boolean }): Promise<void> {
+		const session = record.session;
+		if (this.#sessions.get(session.sessionId) !== record) return;
+		if (!record.lifetimeUnsubscribe && !options?.modeReported) return;
+		const snapshot = buildGoalModeSnapshot(session.getGoalModeState(), record.goalArmed);
+		const signature = JSON.stringify(snapshot);
+		const modeId = this.#getCurrentModeId(session);
+		const modeChanged = modeId !== record.reportedModeId;
+		record.reportedModeId = modeId;
+		if (signature !== record.reportedGoalSnapshot) {
+			record.reportedGoalSnapshot = signature;
+			await this.#connection.sessionUpdate({
+				sessionId: session.sessionId,
+				update: { sessionUpdate: "goal_update", ...snapshot },
+			});
+		}
+		if (modeChanged && !options?.modeReported) {
+			await this.#connection.sessionUpdate({
+				sessionId: session.sessionId,
+				update: this.#buildCurrentModeUpdate(session),
+			});
+			await this.#pushConfigOptionUpdate(record);
+		}
+	}
+
+	/** Restore plan and goal modes journaled in the session (load, resume, fork, in-process switch). */
+	async #reconcileModesFromSession(record: ManagedSessionRecord): Promise<void> {
+		await this.#reconcilePlanModeFromSession(record);
+		const session = record.session;
+		const armed = record.goalArmed;
+		record.goalArmed = undefined;
+		if (armed === "interview") await record.goal.releaseInterviewTool();
+		const mode = session.sessionManager.buildSessionContext().mode;
+		// Only a goal transcript, or a goal left over from the previous one, needs the controller.
+		// Reloaded active goals come back paused, as in the TUI.
+		if (mode !== "goal" && mode !== "goal_paused" && !session.getGoalModeState()) return;
+		await record.goal.reconcile();
+	}
+
+	/**
+	 * Text-mode run-mode commands (`/goal`, `/guided-goal`). Their builtins are
+	 * TUI-only, so ACP handles them here, where the prompt turn they may extend
+	 * is available. Returns true when the text was consumed.
+	 */
+	async #tryRunRunModeCommand(
+		record: ManagedSessionRecord,
+		text: string,
+		images: AgentImageContent[],
+	): Promise<boolean> {
+		const parsed = parseSlashCommand(text);
+		if (!parsed || (parsed.name !== "goal" && parsed.name !== "guided-goal")) return false;
+		// Disabled goal mode advertises no goal commands; the text takes the normal path.
+		if (!cfgGoalEnabled.get(record.session.settings)) return false;
+		try {
+			if (parsed.name === "goal") {
+				await this.#runGoalCommand(record, parsed.args, images);
+			} else {
+				await this.#runGuidedGoalCommand(record, parsed.args, images);
+			}
+		} catch (error) {
+			await this.#finishRunModeCommand(record, error instanceof Error ? error.message : String(error));
+		}
+		return true;
+	}
+
+	async #runGoalCommand(record: ManagedSessionRecord, args: string, images: AgentImageContent[]): Promise<void> {
+		const session = record.session;
+		const { sub, rest } = parseGoalSubcommand(args);
+		const state = session.getGoalModeState();
+		switch (sub) {
+			case undefined:
+			case "set": {
+				if (!rest) {
+					await this.#finishRunModeCommand(record, sub === "set" ? GOAL_USAGE : formatGoalDetails(state));
+					return;
+				}
+				const error = await this.#startGoal(record, rest);
+				if (error) {
+					await this.#finishRunModeCommand(record, error);
+					return;
+				}
+				// The objective runs as the goal's first turn, as with the TUI's `/goal <objective>`.
+				await this.#runRunModeTurn(record, rest, images);
+				return;
+			}
+			case "show":
+				await this.#finishRunModeCommand(record, formatGoalDetails(state));
+				return;
+			case "pause":
+				if (!state?.enabled) {
+					await this.#finishRunModeCommand(record, "No active goal to pause.");
+					return;
+				}
+				await record.goal.handle({ op: "pause" });
+				await this.#finishRunModeCommand(record, "Goal paused.");
+				return;
+			case "resume":
+				if (!state) {
+					await this.#finishRunModeCommand(record, "No goal to resume.");
+					return;
+				}
+				// Resuming schedules the next goal turn; on an active goal, continue now.
+				if (state.enabled) record.goal.continueNow();
+				else await record.goal.handle({ op: "resume" });
+				await this.#emitCommandOutput(record, "Goal resumed.");
+				await this.#settleRunModeCommand(record);
+				return;
+			case "drop":
+				if (!state) {
+					await this.#finishRunModeCommand(record, "No goal to drop.");
+					return;
+				}
+				await record.goal.handle({ op: "drop" });
+				await this.#finishRunModeCommand(record, "Goal dropped.");
+				return;
+			case "budget": {
+				if (!state?.enabled) {
+					await this.#finishRunModeCommand(
+						record,
+						state ? "Resume the goal before adjusting the budget." : "No active goal.",
+					);
+					return;
+				}
+				const budget = parseGoalBudget(rest);
+				if (!budget) {
+					await this.#finishRunModeCommand(record, "Goal budget must be a positive integer or `off`.");
+					return;
+				}
+				await session.goalRuntime.onBudgetMutated(budget.budget);
+				// A raised budget lifts a budget limit: continue in this prompt.
+				record.goal.continueNow();
+				await this.#emitCommandOutput(
+					record,
+					budget.budget === undefined ? "Goal budget cleared." : `Goal budget set to ${budget.budget}.`,
+				);
+				await this.#settleRunModeCommand(record);
+				return;
+			}
+		}
+	}
+
+	/** `/guided-goal`: the agent interviews the operator in chat, then calls `goal create`. */
+	async #runGuidedGoalCommand(record: ManagedSessionRecord, args: string, images: AgentImageContent[]): Promise<void> {
+		const session = record.session;
+		const blocked = this.#goalEntryBlocker(session);
+		const state = session.getGoalModeState();
+		if (blocked || state) {
+			await this.#finishRunModeCommand(
+				record,
+				blocked ??
+					(state?.enabled
+						? "Goal mode is already active. Use /goal to manage it, or /goal drop to start over."
+						: "Resume the current goal first, or drop it before setting a new objective."),
+			);
+			return;
+		}
+		await record.goal.armToolForInterview();
+		record.goalArmed = "interview";
+		await this.#syncRunModeState(record);
+		const kickoff = prompt.render(guidedGoalInterviewPrompt, { initial: args.trim() || undefined });
+		try {
+			await this.#runRunModeTurn(record, kickoff, images, { synthetic: true });
+		} catch (error) {
+			record.goalArmed = undefined;
+			await record.goal.releaseInterviewTool();
+			throw error;
+		}
+	}
+
+	#goalEntryBlocker(session: AgentSession): string | undefined {
+		if (session.getPlanModeState()?.enabled) return "Exit plan mode first.";
+		if (session.getVibeModeState()?.enabled) return "Exit vibe mode first.";
+		return undefined;
+	}
+
+	/** Create (or, on an active goal, replace) the goal; returns the operator-facing refusal, if any. */
+	async #startGoal(record: ManagedSessionRecord, objective: string): Promise<string | undefined> {
+		const session = record.session;
+		const blocked = this.#goalEntryBlocker(session);
+		if (blocked) return blocked;
+		const state = session.getGoalModeState();
+		try {
+			if (state?.enabled) {
+				session.setGoalModeState(await session.goalRuntime.replaceGoal({ objective }));
+			} else if (state) {
+				return "Resume the current goal first, or drop it before setting a new objective.";
+			} else {
+				// The caller sends the objective as the first goal turn, so no continuation yet.
+				await record.goal.handle({ op: "create", objective }, { scheduleContinuation: false });
+			}
+		} catch (error) {
+			return error instanceof Error ? error.message : String(error);
+		}
+		record.goalArmed = undefined;
+		await this.#syncRunModeState(record);
+		return undefined;
+	}
+
+	/** Run a run-mode turn inside the current prompt; its `agent_end` settles the prompt. */
+	async #runRunModeTurn(
+		record: ManagedSessionRecord,
+		text: string,
+		images: AgentImageContent[],
+		options?: { synthetic?: boolean },
+	): Promise<void> {
+		const baseline = new Set(record.extensionUserMessageTasks);
+		const agentInvoked = await record.session.prompt(
+			text,
+			options?.synthetic ? { images, synthetic: true } : { images },
+		);
+		if (!agentInvoked) {
+			await this.#waitForExtensionUserMessages(record, baseline);
+			await this.#waitForPromptEventHandlers(record);
+			await this.#finishRunModeCommand(record);
+		}
+	}
+
+	/** Settle a prompt consumed by a run-mode command, optionally with operator output. */
+	async #finishRunModeCommand(record: ManagedSessionRecord, output?: string): Promise<void> {
+		if (output) await this.#emitCommandOutput(record, output);
+		await this.#syncRunModeState(record);
+		const current = record.session.sessionManager.getUsageStatistics();
+		this.#finishPrompt(record, {
+			stopReason: "end_turn",
+			usage: this.#buildTurnUsage(record.promptTurn?.usageBaseline ?? this.#cloneUsageStatistics(current), current),
+		});
+	}
+
+	/** A command scheduled goal work (`/goal resume`, `/goal budget`): keep the prompt open until it ends. */
+	async #settleRunModeCommand(record: ManagedSessionRecord): Promise<void> {
+		const promptTurn = record.promptTurn;
+		if (!promptTurn || promptTurn.settled) return;
+		promptTurn.settling = true;
+		try {
+			await this.#runPromptFollowUps(record, promptTurn);
+			if (record.promptTurn !== promptTurn || promptTurn.abortController.signal.aborted) return;
+			record.liveMessageId = undefined;
+			record.liveMessageProgress = undefined;
+			this.#finishPrompt(record, {
+				stopReason: "end_turn",
+				usage: this.#buildTurnUsage(promptTurn.usageBaseline, record.session.sessionManager.getUsageStatistics()),
+			});
+		} finally {
+			promptTurn.settling = false;
+		}
 	}
 
 	/**
@@ -2868,6 +3283,14 @@ export class AcpAgent implements Agent {
 					planExists: review.planExists,
 				}
 			: { version: 1, active: false };
+		const record = this.#sessions.get(session.sessionId);
+		const goalMeta = buildGoalModeMeta(session.getGoalModeState(), record?.goalArmed);
+		meta["omp.goalMode"] = goalMeta;
+		if (record) {
+			// The response tells the client this state; later pushes only send changes.
+			record.reportedGoalSnapshot = JSON.stringify({ goal: goalMeta.goal, armed: goalMeta.armed });
+			record.reportedModeId = this.#getCurrentModeId(session);
+		}
 		return meta;
 	}
 
@@ -3098,6 +3521,7 @@ export class AcpAgent implements Agent {
 				settled: false,
 				errorTextDelivery: undefined,
 				cleanup: undefined,
+				settling: false,
 				usageBaseline: this.#cloneUsageStatistics(record.session.sessionManager.getUsageStatistics()),
 				unsubscribe: undefined,
 				resolve: pendingPrompt.resolve,
@@ -3229,7 +3653,12 @@ export class AcpAgent implements Agent {
 	}
 
 	async #buildAvailableCommands(session: AgentSession): Promise<AvailableCommand[]> {
-		return toAcpAvailableCommands(await buildAvailableSlashCommands(session));
+		const commands = toAcpAvailableCommands(await buildAvailableSlashCommands(session));
+		// Run-mode commands are dispatched by this agent before any other command
+		// source, so a same-named extension or file command would never run.
+		const runModeCommands = cfgGoalEnabled.get(session.settings) ? ACP_GOAL_COMMANDS : [];
+		const reserved = new Set(runModeCommands.map(command => command.name));
+		return [...commands.filter(command => !reserved.has(command.name)), ...runModeCommands];
 	}
 
 	#toSessionInfo(session: StoredSessionInfo): SessionInfo {
@@ -3289,7 +3718,11 @@ export class AcpAgent implements Agent {
 					unsubscribeCommands();
 				};
 			}
-			void this.#emitBootstrapUpdates(sessionId, record);
+			// Fire-and-forget from a timer: a failure (e.g. the session went away
+			// mid-bootstrap) must not surface as an unhandled rejection.
+			void this.#emitBootstrapUpdates(sessionId, record).catch((error: unknown) => {
+				logger.warn("Failed to emit ACP bootstrap updates", { sessionId, error });
+			});
 		}, ACP_BOOTSTRAP_RACE_GUARD_MS);
 	}
 
@@ -3982,6 +4415,7 @@ export class AcpAgent implements Agent {
 
 	async #disposeSessionRecord(record: ManagedSessionRecord, reason?: postmortem.Reason): Promise<void> {
 		record.lifetimeUnsubscribe?.();
+		record.runModeUnsubscribe?.();
 		if (record.mcpManager) {
 			try {
 				await record.mcpManager.disconnectAll();

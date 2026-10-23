@@ -117,6 +117,12 @@ class FakeAgentSession {
 	getPlanModeState(): undefined {
 		return undefined;
 	}
+	getGoalModeState(): undefined {
+		return undefined;
+	}
+	getVibeModeState(): undefined {
+		return undefined;
+	}
 	setPlanModeState(): void {}
 	async sendCustomMessage(): Promise<void> {}
 	async sendUserMessage(): Promise<void> {}
