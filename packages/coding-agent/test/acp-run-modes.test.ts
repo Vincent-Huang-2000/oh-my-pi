@@ -138,10 +138,10 @@ function updatesOf<K extends SessionUpdate["sessionUpdate"]>(
 	harness: Harness,
 	sessionId: string,
 	kind: K,
-): Array<Extract<SessionUpdate, { sessionUpdate: K }>> {
+): Array<SessionUpdate & { sessionUpdate: K }> {
 	return harness.updates
 		.filter(notification => notification.sessionId === sessionId && notification.update.sessionUpdate === kind)
-		.map(notification => notification.update as Extract<SessionUpdate, { sessionUpdate: K }>);
+		.map(notification => notification.update as SessionUpdate & { sessionUpdate: K });
 }
 
 function text(value: string) {
