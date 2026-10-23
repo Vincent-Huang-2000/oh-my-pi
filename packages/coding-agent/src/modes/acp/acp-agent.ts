@@ -121,11 +121,19 @@ import {
 	ACP_GOAL_COMMANDS,
 	ACP_GOAL_CONTINUATION_MODE,
 	ACP_GOAL_MODE_ID,
+	ACP_VIBE_COMMANDS,
+	ACP_VIBE_MODE_ID,
+	type AcpVibeState,
 	buildGoalModeMeta,
 	buildGoalModeSnapshot,
+	buildVibeModeMeta,
+	enterVibeMode,
+	exitVibeMode,
 	formatGoalDetails,
 	GOAL_USAGE,
 	parseGoalBudget,
+	restoreVibeMode,
+	suspendVibeMode,
 } from "./acp-run-modes";
 import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
 
@@ -397,6 +405,8 @@ type ManagedSessionRecord = {
 	goal: RpcGoalController;
 	/** Goal mode entered before a goal exists: the next prompt is the objective, or the guided interview runs. */
 	goalArmed: GoalModeArmed | undefined;
+	/** Live vibe mode (pre-vibe tool set and worker scope), set while the session directs workers. */
+	vibe: AcpVibeState | undefined;
 	/** Last `goal_update` body and mode id the client was told about; pushes only on change. */
 	reportedGoalSnapshot: string | undefined;
 	reportedModeId: string | undefined;
@@ -1898,6 +1908,7 @@ export class AcpAgent implements Agent {
 			pendingPlanOutcome: undefined,
 			goal,
 			goalArmed: undefined,
+			vibe: undefined,
 			reportedGoalSnapshot: undefined,
 			reportedModeId: undefined,
 			runModeUnsubscribe: undefined,
@@ -2083,27 +2094,57 @@ export class AcpAgent implements Agent {
 
 	/**
 	 * Keep a client prompt open while work it owns continues: goal continuation
-	 * turns the goal controller schedules at each yield. Each follow-up turn
-	 * streams through the prompt's subscription. Returns whether any ran; the
-	 * run-mode state is pushed to the client before the prompt settles.
+	 * turns the goal controller schedules at each yield, and in vibe mode the
+	 * worker turns whose results wake the director (as the TUI delivers them).
+	 * Each follow-up turn streams through the prompt's subscription. Returns
+	 * whether any ran; the run-mode state is pushed before the prompt settles.
 	 */
 	async #runPromptFollowUps(record: ManagedSessionRecord, promptTurn: PromptTurnState): Promise<boolean> {
 		const session = record.session;
 		let followedUp = false;
 		while (record.promptTurn === promptTurn && !promptTurn.abortController.signal.aborted) {
-			if (!record.goal.continuationPending) break;
-			await record.goal.whenContinuationDecided();
-			// A dropped continuation leaves the session idle.
-			if (!session.isStreaming && !session.hasAdmittedSubmission) continue;
+			if (record.goal.continuationPending) {
+				await record.goal.whenContinuationDecided();
+				// A dropped continuation leaves the session idle.
+				if (!session.isStreaming && !session.hasAdmittedSubmission) continue;
+				followedUp = true;
+				// An admitted continuation may not be streaming yet, and `waitForIdle` does
+				// not wait for it: let it dispatch first, then wait for its run.
+				await session.waitForAdmittedSubmissions();
+				await this.#waitForAcpPromptIdle(record);
+				continue;
+			}
+			if (!(await this.#waitForVibeWorkers(record, promptTurn))) break;
+			// Finished worker turns deliver their results, each waking the director.
 			followedUp = true;
-			// An admitted continuation may not be streaming yet, and `waitForIdle` does
-			// not wait for it: let it dispatch first, then wait for its run.
-			await session.waitForAdmittedSubmissions();
 			await this.#waitForAcpPromptIdle(record);
 		}
 		await record.goal.settled();
 		await this.#syncRunModeState(record);
 		return followedUp;
+	}
+
+	/**
+	 * Wait for the vibe scope's running worker turns (ones whose results are still
+	 * owed to the director). Stop ends the wait; the workers keep running and their
+	 * results reach the director with the next prompt. Returns whether it waited.
+	 */
+	async #waitForVibeWorkers(record: ManagedSessionRecord, promptTurn: PromptTurnState): Promise<boolean> {
+		const manager = record.session.asyncJobManager;
+		const ownerId = record.vibe?.ownerScope.ownerId;
+		if (!manager || !ownerId) return false;
+		const running = manager.getRunningJobs({ ownerId }).some(job => !manager.isDeliverySuppressed(job.id));
+		if (!running) return false;
+		const signal = promptTurn.abortController.signal;
+		const stopped = Promise.withResolvers<void>();
+		const onAbort = () => stopped.resolve();
+		signal.addEventListener("abort", onAbort, { once: true });
+		try {
+			await Promise.race([manager.waitForOwnerJobs(ownerId, { excludeSuppressed: true }), stopped.promise]);
+		} finally {
+			signal.removeEventListener("abort", onAbort);
+		}
+		return !signal.aborted && record.promptTurn === promptTurn;
 	}
 
 	/**
@@ -2485,12 +2526,21 @@ export class AcpAgent implements Agent {
 				description: "Persistent objective the agent keeps working toward until it is complete",
 			});
 		}
+		// Only top-level sessions carry the vibe tool factory.
+		if (session.vibeToolsAvailable) {
+			modes.push({
+				id: ACP_VIBE_MODE_ID,
+				name: "Vibe",
+				description: "Direct persistent fast/good worker sessions from a read-only toolset",
+			});
+		}
 		return modes;
 	}
 
 	/** Plan, goal, and vibe share one mode slot (the session journal records a single mode). */
 	#getCurrentModeId(session: AgentSession): string {
 		if (session.getPlanModeState()?.enabled) return ACP_PLAN_MODE_ID;
+		if (session.getVibeModeState()?.enabled) return ACP_VIBE_MODE_ID;
 		if (session.getGoalModeState() || this.#sessions.get(session.sessionId)?.goalArmed) return ACP_GOAL_MODE_ID;
 		return ACP_DEFAULT_MODE_ID;
 	}
@@ -2521,13 +2571,18 @@ export class AcpAgent implements Agent {
 				if (session.getGoalModeState()?.goal.status === "paused") await record.goal.handle({ op: "resume" });
 				return;
 			}
+			if (modeId === ACP_VIBE_MODE_ID && currentModeId === ACP_VIBE_MODE_ID) return;
 			// The goal cannot share the single mode slot with another mode: leaving
 			// goal mode drops it (accumulated usage stays in the session log).
 			if (currentModeId === ACP_GOAL_MODE_ID) await this.#exitGoalMode(record);
+			if (currentModeId === ACP_VIBE_MODE_ID) await this.#exitVibeMode(record);
 			if (modeId === ACP_GOAL_MODE_ID) {
 				if (currentModeId === ACP_PLAN_MODE_ID) await this.#exitPlanMode(record);
 				// No goal yet: the next prompt becomes its objective.
 				record.goalArmed = "objective";
+			} else if (modeId === ACP_VIBE_MODE_ID) {
+				if (currentModeId === ACP_PLAN_MODE_ID) await this.#exitPlanMode(record);
+				record.vibe = await enterVibeMode(session);
 			} else if (modeId === ACP_PLAN_MODE_ID) {
 				const previous = session.getPlanModeState();
 				const planFilePath = previous?.planFilePath ?? DEFAULT_PLAN_FILE_URL;
@@ -2576,6 +2631,13 @@ export class AcpAgent implements Agent {
 		}
 	}
 
+	/** Leave vibe mode, killing the scope's workers. Returns the kill count. */
+	async #exitVibeMode(record: ManagedSessionRecord): Promise<number> {
+		const state = record.vibe;
+		record.vibe = undefined;
+		return state ? await exitVibeMode(record.session, state) : 0;
+	}
+
 	#observeRunModeEvent(record: ManagedSessionRecord, event: AgentSessionEvent): void {
 		record.goal.observe(event);
 		if (event.type !== "goal_updated") return;
@@ -2619,7 +2681,7 @@ export class AcpAgent implements Agent {
 		}
 	}
 
-	/** Restore plan and goal modes journaled in the session (load, resume, fork, in-process switch). */
+	/** Restore plan, goal, and vibe modes journaled in the session (load, resume, fork, in-process switch). */
 	async #reconcileModesFromSession(record: ManagedSessionRecord): Promise<void> {
 		await this.#reconcilePlanModeFromSession(record);
 		const session = record.session;
@@ -2629,13 +2691,19 @@ export class AcpAgent implements Agent {
 		const mode = session.sessionManager.buildSessionContext().mode;
 		// Only a goal transcript, or a goal left over from the previous one, needs the controller.
 		// Reloaded active goals come back paused, as in the TUI.
-		if (mode !== "goal" && mode !== "goal_paused" && !session.getGoalModeState()) return;
-		await record.goal.reconcile();
+		if (mode === "goal" || mode === "goal_paused" || session.getGoalModeState()) await record.goal.reconcile();
+		// Workers belong to the transcript that spawned them: park them, then rehydrate this one's.
+		const vibe = record.vibe;
+		record.vibe = undefined;
+		if (vibe) await suspendVibeMode(session, vibe);
+		if (mode !== "vibe") return;
+		if (session.vibeToolsAvailable) record.vibe = await restoreVibeMode(session);
+		else session.sessionManager.appendModeChange("none");
 	}
 
 	/**
-	 * Text-mode run-mode commands (`/goal`, `/guided-goal`). Their builtins are
-	 * TUI-only, so ACP handles them here, where the prompt turn they may extend
+	 * Text-mode run-mode commands (`/goal`, `/guided-goal`, `/vibe`). Their builtins
+	 * are TUI-only, so ACP handles them here, where the prompt turn they may extend
 	 * is available. Returns true when the text was consumed.
 	 */
 	async #tryRunRunModeCommand(
@@ -2644,6 +2712,14 @@ export class AcpAgent implements Agent {
 		images: AgentImageContent[],
 	): Promise<boolean> {
 		const parsed = parseSlashCommand(text);
+		if (parsed?.name === "vibe" && record.session.vibeToolsAvailable) {
+			try {
+				await this.#runVibeCommand(record, parsed.args, images);
+			} catch (error) {
+				await this.#finishRunModeCommand(record, error instanceof Error ? error.message : String(error));
+			}
+			return true;
+		}
 		if (!parsed || (parsed.name !== "goal" && parsed.name !== "guided-goal")) return false;
 		// Disabled goal mode advertises no goal commands; the text takes the normal path.
 		if (!cfgGoalEnabled.get(record.session.settings)) return false;
@@ -2761,6 +2837,41 @@ export class AcpAgent implements Agent {
 			await record.goal.releaseInterviewTool();
 			throw error;
 		}
+	}
+
+	/** `/vibe [prompt]` toggles vibe mode; entering with a prompt sends it as the first directive. */
+	async #runVibeCommand(record: ManagedSessionRecord, args: string, images: AgentImageContent[]): Promise<void> {
+		const session = record.session;
+		if (record.vibe) {
+			const killed = await this.#exitVibeMode(record);
+			await this.#finishRunModeCommand(
+				record,
+				killed > 0
+					? `Vibe mode disabled. Killed ${killed} worker session${killed === 1 ? "" : "s"}.`
+					: "Vibe mode disabled.",
+			);
+			return;
+		}
+		const blocked = session.getPlanModeState()?.enabled
+			? "Exit plan mode first."
+			: session.getGoalModeState() || record.goalArmed
+				? "Exit goal mode first."
+				: undefined;
+		if (blocked) {
+			await this.#finishRunModeCommand(record, blocked);
+			return;
+		}
+		record.vibe = await enterVibeMode(session);
+		const directive = args.trim();
+		if (!directive) {
+			await this.#finishRunModeCommand(
+				record,
+				"Vibe mode enabled. You direct fast/good worker sessions; toolset is read + optional parent Todo + vibe tools.",
+			);
+			return;
+		}
+		await this.#syncRunModeState(record);
+		await this.#runRunModeTurn(record, directive, images);
 	}
 
 	#goalEntryBlocker(session: AgentSession): string | undefined {
@@ -3286,6 +3397,7 @@ export class AcpAgent implements Agent {
 		const record = this.#sessions.get(session.sessionId);
 		const goalMeta = buildGoalModeMeta(session.getGoalModeState(), record?.goalArmed);
 		meta["omp.goalMode"] = goalMeta;
+		meta["omp.vibeMode"] = buildVibeModeMeta(session.getVibeModeState()?.enabled === true);
 		if (record) {
 			// The response tells the client this state; later pushes only send changes.
 			record.reportedGoalSnapshot = JSON.stringify({ goal: goalMeta.goal, armed: goalMeta.armed });
@@ -3656,7 +3768,10 @@ export class AcpAgent implements Agent {
 		const commands = toAcpAvailableCommands(await buildAvailableSlashCommands(session));
 		// Run-mode commands are dispatched by this agent before any other command
 		// source, so a same-named extension or file command would never run.
-		const runModeCommands = cfgGoalEnabled.get(session.settings) ? ACP_GOAL_COMMANDS : [];
+		const runModeCommands = [
+			...(cfgGoalEnabled.get(session.settings) ? ACP_GOAL_COMMANDS : []),
+			...(session.vibeToolsAvailable ? ACP_VIBE_COMMANDS : []),
+		];
 		const reserved = new Set(runModeCommands.map(command => command.name));
 		return [...commands.filter(command => !reserved.has(command.name)), ...runModeCommands];
 	}
@@ -4416,6 +4531,16 @@ export class AcpAgent implements Agent {
 	async #disposeSessionRecord(record: ManagedSessionRecord, reason?: postmortem.Reason): Promise<void> {
 		record.lifetimeUnsubscribe?.();
 		record.runModeUnsubscribe?.();
+		// Closing is not exiting vibe mode: park the workers so a reload can rehydrate them.
+		const vibe = record.vibe;
+		record.vibe = undefined;
+		if (vibe) {
+			try {
+				await suspendVibeMode(record.session, vibe);
+			} catch (error) {
+				logger.warn("Failed to suspend ACP vibe workers", { error });
+			}
+		}
 		if (record.mcpManager) {
 			try {
 				await record.mcpManager.disconnectAll();

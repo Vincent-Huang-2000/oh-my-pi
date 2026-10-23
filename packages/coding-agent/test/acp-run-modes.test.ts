@@ -299,3 +299,99 @@ describe("ACP goal mode", () => {
 		expect(response._meta?.["omp.goalMode"]).toEqual({ version: 1, active: true, goal: null, armed: "objective" });
 	});
 });
+
+describe("ACP vibe mode", () => {
+	it("swaps in the director tool set and restores the previous tools on exit", async () => {
+		const harness = await createHarness();
+		const { sessionId, session } = await startSession(harness);
+		const toolsBefore = session.getEnabledToolNames();
+		expect(toolsBefore).toContain("edit");
+
+		const entered = await harness.agent.setSessionMode({ sessionId, modeId: "vibe" });
+
+		expect(entered._meta?.["omp.vibeMode"]).toEqual({ version: 1, active: true });
+		const directorTools = session.getEnabledToolNames();
+		expect(directorTools).toEqual(expect.arrayContaining(["read", "vibe_spawn", "vibe_send", "vibe_wait"]));
+		expect(directorTools).not.toContain("edit");
+		expect(session.sessionManager.buildSessionContext().mode).toBe("vibe");
+
+		const exited = await harness.agent.setSessionMode({ sessionId, modeId: "default" });
+
+		expect(exited._meta?.["omp.vibeMode"]).toEqual({ version: 1, active: false });
+		expect(session.getEnabledToolNames()).toEqual(toolsBefore);
+		expect(session.sessionManager.buildSessionContext().mode).toBe("none");
+	});
+
+	it("keeps the prompt open until a running worker turn's result reaches the director", async () => {
+		const harness = await createHarness();
+		const { sessionId, session } = await startSession(harness);
+		await harness.agent.setSessionMode({ sessionId, modeId: "vibe" });
+		const manager = session.asyncJobManager!;
+		const workerDone = Promise.withResolvers<void>();
+		manager.register(
+			"task",
+			"vibe fast w1",
+			async () => {
+				await workerDone.promise;
+				return "worker finished the migration";
+			},
+			{ agentId: "w1", ownerId: session.getAgentId() },
+		);
+		harness.turns.push({ content: ["Waiting on the worker."] }, { content: ["The worker is done."] });
+
+		let settled = false;
+		const pending = harness.agent.prompt({ sessionId, prompt: text("check the worker") });
+		void pending.then(() => {
+			settled = true;
+		});
+		while (harness.modelCalls() < 1) await Bun.sleep(10);
+		await session.waitForIdle();
+		await Bun.sleep(50);
+		expect(settled).toBe(false);
+
+		workerDone.resolve();
+		const response = await pending;
+
+		expect(response.stopReason).toBe("end_turn");
+		expect(harness.modelCalls()).toBe(2);
+		expect(JSON.stringify(harness.modelMessages(1))).toContain("worker finished the migration");
+	});
+
+	it("ends the worker wait on cancel and leaves the worker running", async () => {
+		const harness = await createHarness();
+		const { sessionId, session } = await startSession(harness);
+		await harness.agent.setSessionMode({ sessionId, modeId: "vibe" });
+		const manager = session.asyncJobManager!;
+		const workerDone = Promise.withResolvers<void>();
+		const jobId = manager.register(
+			"task",
+			"vibe fast w1",
+			async () => {
+				await workerDone.promise;
+				return "late result";
+			},
+			{ agentId: "w1", ownerId: session.getAgentId() },
+		);
+
+		const pending = harness.agent.prompt({ sessionId, prompt: text("start the work") });
+		while (harness.modelCalls() < 1) await Bun.sleep(10);
+		await session.waitForIdle();
+		await harness.agent.cancel({ sessionId });
+
+		expect((await pending).stopReason).toBe("cancelled");
+		expect(manager.getJob(jobId)?.status).toBe("running");
+		workerDone.resolve();
+	});
+
+	it("refuses /vibe while a goal occupies the mode slot", async () => {
+		const harness = await createHarness();
+		const { sessionId, session } = await startSession(harness);
+		await harness.agent.prompt({ sessionId, prompt: text("/goal ship it") });
+
+		await harness.agent.prompt({ sessionId, prompt: text("/vibe") });
+
+		expect(session.getVibeModeState()).toBeUndefined();
+		const output = updatesOf(harness, sessionId, "agent_message_chunk").at(-1);
+		expect(output?.content).toEqual({ type: "text", text: "Exit goal mode first." });
+	});
+});
