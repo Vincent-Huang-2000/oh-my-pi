@@ -91,8 +91,10 @@ items left, or a continuation turn makes no new progress. Every goal turn
 streams as part of that prompt. Goal turns never start outside a client
 prompt; selecting `goal` to resume a paused goal waits for the next prompt.
 
-`session/cancel` (or a new prompt that interrupts the turn) pauses the goal
-and stops continuation. `/goal resume` restarts it.
+`session/cancel` pauses the goal and stops continuation. So does a new
+`session/prompt` that arrives while goal turns are still owed to the current
+prompt, even between turns: it interrupts the goal instead of queueing behind
+it. `/goal resume` restarts it.
 
 ## Commands
 
@@ -116,8 +118,9 @@ plan or goal mode is on (`Exit … mode first.`).
 Worker turns run in the background and their results wake the director. While
 a director prompt has worker turns running whose results are still owed to it,
 the prompt stays open and each finished worker's result runs a director turn
-that streams to the client. `session/cancel` ends the wait only: the workers
-keep running and their results reach the director with the next prompt.
+that streams to the client. `session/cancel`, or a new prompt, ends the wait
+only: the workers keep running and their results reach the director in a later
+prompt.
 Closing the session parks the workers; reloading a vibe session rehydrates
 them.
 

@@ -383,6 +383,36 @@ describe("ACP vibe mode", () => {
 		workerDone.resolve();
 	});
 
+	it("lets a new prompt interrupt the worker wait instead of queueing behind it", async () => {
+		const harness = await createHarness();
+		const { sessionId, session } = await startSession(harness);
+		await harness.agent.setSessionMode({ sessionId, modeId: "vibe" });
+		const workerDone = Promise.withResolvers<void>();
+		session.asyncJobManager!.register(
+			"task",
+			"vibe fast w1",
+			async () => {
+				await workerDone.promise;
+				return "late result";
+			},
+			{ agentId: "w1", ownerId: session.getAgentId() },
+		);
+		harness.turns.push({ content: ["Started the worker."] }, { content: ["Here is the status."] });
+
+		const waiting = harness.agent.prompt({ sessionId, prompt: text("start the work") });
+		while (harness.modelCalls() < 1) await Bun.sleep(10);
+		await session.waitForIdle();
+		const next = harness.agent.prompt({ sessionId, prompt: text("what is the status?") });
+
+		// The new prompt runs while the worker is still busy.
+		expect((await waiting).stopReason).toBe("cancelled");
+		while (harness.modelCalls() < 2) await Bun.sleep(10);
+		// It then waits for the worker itself, whose result wakes the director.
+		workerDone.resolve();
+		expect((await next).stopReason).toBe("end_turn");
+		expect(harness.modelCalls()).toBe(3);
+	});
+
 	it("refuses /vibe while a goal occupies the mode slot", async () => {
 		const harness = await createHarness();
 		const { sessionId, session } = await startSession(harness);

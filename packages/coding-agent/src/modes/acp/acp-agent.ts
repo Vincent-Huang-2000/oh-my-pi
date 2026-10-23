@@ -224,6 +224,12 @@ type PromptTurnState = {
 	 * turns' `agent_end` handlers flush their own output and leave settlement to it.
 	 */
 	settling: boolean;
+	/**
+	 * The turn is held open only for follow-up work (between goal continuation
+	 * turns, or waiting on vibe workers). A new client prompt interrupts it as it
+	 * would a streaming turn, instead of queueing behind autonomous work.
+	 */
+	followingUp: boolean;
 	usageBaseline: UsageStatistics;
 	unsubscribe: (() => void) | undefined;
 	resolve: (value: PromptResponse) => void;
@@ -418,6 +424,8 @@ type ManagedSessionRecord = {
 	// inside the dispatch window). Marked by cancel(); consumed at slot
 	// creation so a stop never leaves a prompt streaming behind the client's back.
 	pendingPromptDispatches: Array<PromptDispatchCancellation>;
+	/** Client prompts (and plan-review actions) queued behind the running turn, not yet started. */
+	waitingPrompts: number;
 	liveMessageId: string | undefined;
 	liveMessageProgress: { textEmitted: boolean; thoughtEmitted: boolean } | undefined;
 	toolArgsById: Map<string, unknown>;
@@ -1079,7 +1087,9 @@ export class AcpAgent implements Agent {
 		// idle new turn (queued normally) or inside the abort window — where
 		// the implicit cancel below matches the user's stop intent. No
 		// resubmission bookkeeping is needed here anymore.
-		if (activeTurn && !activeTurn.settled && record.session.isStreaming) {
+		// A turn held open between goal turns or for vibe workers is not streaming,
+		// but the operator's new prompt still interrupts it (pausing the goal).
+		if (activeTurn && !activeTurn.settled && (record.session.isStreaming || activeTurn.followingUp)) {
 			// New prompt arrived while the previous turn is still in-flight (e.g. the
 			// client sent a message immediately after pressing stop, before or without
 			// a preceding session/cancel notification). Implicitly cancel the running
@@ -1126,6 +1136,7 @@ export class AcpAgent implements Agent {
 					errorTextDelivery: undefined,
 					cleanup: undefined,
 					settling: false,
+					followingUp: false,
 					usageBaseline: this.#cloneUsageStatistics(record.session.sessionManager.getUsageStatistics()),
 					unsubscribe: undefined,
 					resolve: pendingPrompt.resolve,
@@ -1193,7 +1204,12 @@ export class AcpAgent implements Agent {
 			promise: nextQueue.promise,
 			release: releaseQueue,
 		};
-		await previousQueue.promise;
+		record.waitingPrompts++;
+		try {
+			await previousQueue.promise;
+		} finally {
+			record.waitingPrompts--;
+		}
 		this.#throwIfRecordClosed(record);
 		try {
 			return await run();
@@ -1920,6 +1936,7 @@ export class AcpAgent implements Agent {
 			extensionsConfigured: false,
 			closedError: undefined,
 			pendingPromptDispatches: [],
+			waitingPrompts: 0,
 			extensionUserMessageTasks: new Set(),
 			promptEventHandlers: new Set(),
 			lifetimeUnsubscribe: undefined,
@@ -2102,39 +2119,64 @@ export class AcpAgent implements Agent {
 	async #runPromptFollowUps(record: ManagedSessionRecord, promptTurn: PromptTurnState): Promise<boolean> {
 		const session = record.session;
 		let followedUp = false;
-		while (record.promptTurn === promptTurn && !promptTurn.abortController.signal.aborted) {
-			if (record.goal.continuationPending) {
-				await record.goal.whenContinuationDecided();
-				// A dropped continuation leaves the session idle.
-				if (!session.isStreaming && !session.hasAdmittedSubmission) continue;
+		try {
+			while (record.promptTurn === promptTurn && !promptTurn.abortController.signal.aborted) {
+				const continuing = record.goal.continuationPending;
+				if (!continuing && !this.#hasRunningVibeWorkers(record)) break;
+				// The operator already sent the next prompt: it interrupts the follow-up
+				// work (pausing the goal) instead of waiting behind it.
+				if (record.waitingPrompts > 0) {
+					this.#beginCancelCleanup(record, promptTurn).catch(async (error: unknown) => {
+						logger.warn("ACP cancel cleanup timed out; closing session", {
+							sessionId: session.sessionId,
+							error,
+						});
+						await this.#closeManagedSession(session.sessionId, record);
+					});
+					break;
+				}
+				promptTurn.followingUp = true;
+				if (continuing) {
+					await record.goal.whenContinuationDecided();
+					// A dropped continuation leaves the session idle.
+					if (!session.isStreaming && !session.hasAdmittedSubmission) continue;
+					followedUp = true;
+					// An admitted continuation may not be streaming yet, and `waitForIdle` does
+					// not wait for it: let it dispatch first, then wait for its run.
+					await session.waitForAdmittedSubmissions();
+					await this.#waitForAcpPromptIdle(record);
+					continue;
+				}
+				if (!(await this.#waitForVibeWorkers(record, promptTurn))) break;
+				// Finished worker turns deliver their results, each waking the director.
 				followedUp = true;
-				// An admitted continuation may not be streaming yet, and `waitForIdle` does
-				// not wait for it: let it dispatch first, then wait for its run.
-				await session.waitForAdmittedSubmissions();
 				await this.#waitForAcpPromptIdle(record);
-				continue;
 			}
-			if (!(await this.#waitForVibeWorkers(record, promptTurn))) break;
-			// Finished worker turns deliver their results, each waking the director.
-			followedUp = true;
-			await this.#waitForAcpPromptIdle(record);
+		} finally {
+			promptTurn.followingUp = false;
 		}
 		await record.goal.settled();
 		await this.#syncRunModeState(record);
 		return followedUp;
 	}
 
+	/** Vibe worker turns still running whose results are owed to the director. */
+	#hasRunningVibeWorkers(record: ManagedSessionRecord): boolean {
+		const manager = record.session.asyncJobManager;
+		const ownerId = record.vibe?.ownerScope.ownerId;
+		if (!manager || !ownerId) return false;
+		return manager.getRunningJobs({ ownerId }).some(job => !manager.isDeliverySuppressed(job.id));
+	}
+
 	/**
-	 * Wait for the vibe scope's running worker turns (ones whose results are still
-	 * owed to the director). Stop ends the wait; the workers keep running and their
-	 * results reach the director with the next prompt. Returns whether it waited.
+	 * Wait for the vibe scope's running worker turns. Stop ends the wait; the
+	 * workers keep running and their results reach the director with the next
+	 * prompt. Returns whether it waited to completion.
 	 */
 	async #waitForVibeWorkers(record: ManagedSessionRecord, promptTurn: PromptTurnState): Promise<boolean> {
 		const manager = record.session.asyncJobManager;
 		const ownerId = record.vibe?.ownerScope.ownerId;
-		if (!manager || !ownerId) return false;
-		const running = manager.getRunningJobs({ ownerId }).some(job => !manager.isDeliverySuppressed(job.id));
-		if (!running) return false;
+		if (!manager || !ownerId || !this.#hasRunningVibeWorkers(record)) return false;
 		const signal = promptTurn.abortController.signal;
 		const stopped = Promise.withResolvers<void>();
 		const onAbort = () => stopped.resolve();
@@ -3426,6 +3468,8 @@ export class AcpAgent implements Agent {
 		session.setPlanProposalHandler?.(null);
 		session.setPlanModeState(undefined);
 		session.sessionManager.appendModeChange("none");
+		const record = this.#sessions.get(session.sessionId);
+		if (record) record.reportedModeId = this.#getCurrentModeId(session);
 		try {
 			await this.#connection.sessionUpdate({
 				sessionId: session.sessionId,
@@ -3634,6 +3678,7 @@ export class AcpAgent implements Agent {
 				errorTextDelivery: undefined,
 				cleanup: undefined,
 				settling: false,
+				followingUp: false,
 				usageBaseline: this.#cloneUsageStatistics(record.session.sessionManager.getUsageStatistics()),
 				unsubscribe: undefined,
 				resolve: pendingPrompt.resolve,
