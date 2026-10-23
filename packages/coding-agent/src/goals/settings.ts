@@ -24,7 +24,9 @@ export const cfgGoalStatusInFooter = register({
 	},
 });
 
-const GOAL_CONTINUATION_MODES_DEFAULT: string[] = ["interactive"];
+// ACP continues only inside a client `session/prompt` (the client sees and can
+// cancel every goal turn), so it is on by default like the TUI.
+const GOAL_CONTINUATION_MODES_DEFAULT: string[] = ["interactive", "acp"];
 
 export const cfgGoalContinuationModes = register({
 	id: "goal.continuationModes",
@@ -34,6 +36,6 @@ export const cfgGoalContinuationModes = register({
 		tab: "tasks",
 		group: "Modes",
 		label: "Goal Continuation Modes",
-		description: 'Run modes where active goals may auto-continue between turns ("interactive", "rpc")',
+		description: 'Run modes where active goals may auto-continue between turns ("interactive", "acp", "rpc")',
 	},
 });
