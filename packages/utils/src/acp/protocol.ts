@@ -341,6 +341,22 @@ export interface PlanReviewSessionUpdate extends Meta {
 	executionModels?: PlanReviewExecutionModel[];
 	context?: { tokens: number; contextWindow: number };
 }
+/** Goal snapshot carried by the omp.goalMode ACP extension. */
+export interface GoalModeGoal extends Meta {
+	id: string;
+	objective: string;
+	status: "active" | "paused" | "budget-limited" | "complete" | "dropped";
+	tokenBudget?: number;
+	tokensUsed: number;
+	timeUsedSeconds: number;
+	createdAt: number;
+	updatedAt: number;
+}
+/**
+ * Goal mode entered without a goal yet: `objective` takes the next prompt as
+ * the objective, `interview` runs the guided-goal interview.
+ */
+export type GoalModeArmed = "objective" | "interview";
 /** Session plan entry. */
 export interface PlanEntry extends Meta {
 	content: string;
@@ -358,6 +374,7 @@ export type SessionUpdate =
 	| ({ sessionUpdate: "tool_call_update" } & ToolCallUpdate)
 	| ({ sessionUpdate: "plan"; entries: PlanEntry[] } & Meta)
 	| ({ sessionUpdate: "plan_review_update"; review: PlanReviewSessionUpdate | null } & Meta)
+	| ({ sessionUpdate: "goal_update"; goal: GoalModeGoal | null; armed: GoalModeArmed | null } & Meta)
 	| ({ sessionUpdate: "current_mode_update"; currentModeId: string } & Meta)
 	| ({ sessionUpdate: "config_option_update"; configOptions: SessionConfigOption[] } & Meta)
 	| ({ sessionUpdate: "available_commands_update"; availableCommands: AvailableCommand[] } & Meta)
