@@ -124,6 +124,12 @@ class FakeAgentSession {
 	getPlanModeState(): FakeAgentSession["planModeState"] {
 		return this.planModeState;
 	}
+	getGoalModeState(): undefined {
+		return undefined;
+	}
+	getVibeModeState(): undefined {
+		return undefined;
+	}
 
 	setPlanModeState(state: FakeAgentSession["planModeState"]): void {
 		this.planModeState = state;

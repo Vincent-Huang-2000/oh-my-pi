@@ -97,6 +97,12 @@ class ReplayTestSession {
 	getPlanModeState(): undefined {
 		return undefined;
 	}
+	getGoalModeState(): undefined {
+		return undefined;
+	}
+	getVibeModeState(): undefined {
+		return undefined;
+	}
 
 	setPlanModeState(): void {}
 

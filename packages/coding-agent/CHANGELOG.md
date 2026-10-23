@@ -6,7 +6,12 @@
 
 - Added the `omp.planReview` v1 ACP plan-review extension: form-capable ACP clients now get a full five-option review (approve with a fresh session, compact, or keep context; refine with feedback; save and quit) with execution-model selection, a `plan_review_update` session update carrying the review content, `omp.planReview/reopen` and `omp.planReview/action` extension methods, and pending-review restoration when a session reloads.
 - ACP sessions now report `omp.planMode`/`omp.planReview` snapshots in `_meta` on session creation, load, resume, fork, and mode changes.
+- Added goal mode, guided goals, and vibe mode to ACP: the session mode selector offers `goal` and `vibe`, `/goal`, `/guided-goal`, and `/vibe` work from ACP clients, active goals keep working inside the current prompt until they finish or you stop them, and `omp.goalMode`/`omp.vibeMode` snapshots plus a `goal_update` session update report their state.
 - Anthropic web search and Files API uploads follow `PI_ANTHROPIC_API_VERSION=2026-10-21`; web search omits `temperature` under that version ([#16706](https://github.com/can1357/oh-my-pi/pull/16706) by [@H4vC](https://github.com/H4vC))
+
+### Changed
+
+- `goal.continuationModes` now includes `acp` by default, so goals started from an ACP client continue on their own like in the TUI.
 
 ### Fixed
 
