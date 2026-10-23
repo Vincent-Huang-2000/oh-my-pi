@@ -19,7 +19,7 @@ Toggle it with the `/vibe` slash command:
 - Starting, deleting, forking, moving (including `/wt`), or handing off the session is rejected while vibe mode is active. Reset-style `/loop` actions are also blocked.
 - The status line shows a `Vibe` indicator while the mode is on; its token-rate display aggregates generating workers even while the director is idle.
 
-`/vibe` is an interactive-TUI command. The mode and worker lifecycle events are persisted with the parent session. Resuming a session whose current mode is `vibe` rehydrates completed workers as idle/parked sessions with their child transcripts; a turn interrupted by process restart is not resumed automatically. Explicitly killed or mode-exit workers stay terminal.
+`/vibe` runs in the interactive TUI and over ACP (see [ACP run modes](acp-run-modes.md)). The mode and worker lifecycle events are persisted with the parent session. Resuming a session whose current mode is `vibe` rehydrates completed workers as idle/parked sessions with their child transcripts; a turn interrupted by process restart is not resumed automatically. Explicitly killed or mode-exit workers stay terminal.
 
 Switching to a saved session suspends the source scope: running worker turns are cancelled and queued directives are cleared, but the persisted child conversations are not tombstoned. Returning to that parent can rehydrate them; this differs from deliberately exiting `/vibe`.
 
